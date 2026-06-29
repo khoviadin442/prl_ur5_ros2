@@ -47,6 +47,21 @@ M = np.zeros((3, 3))
 for i in range(3):
     M[i, AXIS_MAP[i]] = AXIS_SIGN[i]
 
+COLLISION_MODE   = CFG["teleop"].get("collision_mode", "reanchor")
+MAX_TARGET_SPEED = float(CFG["teleop"].get("max_target_speed", 0.5))
+MAX_LEAD         = float(CFG["teleop"].get("max_lead", 0.05))
+MAX_ANG_SPEED    = float(CFG["teleop"].get("max_ang_speed", 2.0))
+ORI_ALPHA        = float(CFG["teleop"].get("ori_alpha", 0.6))
+FILTER_MIN_CUTOFF= float(CFG["teleop"].get("filter_min_cutoff", 1.0))
+FILTER_BETA      = float(CFG["teleop"].get("filter_beta", 0.007))
+POSE_TIMEOUT     = float(CFG["teleop"].get("pose_timeout", 0.2))
+JOINT_TIMEOUT    = float(CFG["teleop"].get("joint_timeout", 0.3))
+BLEND_TICKS      = int(CFG["teleop"].get("disengage_blend_ticks", 5))
+VR_DT            = 1.0 / 250.0
+MAX_TARGET_STEP  = MAX_TARGET_SPEED * VR_DT
+MAX_ANG_STEP     = MAX_ANG_SPEED * DT
+ORI_SIGN         = np.array(CFG["teleop"].get("ori_sign", [1.0, 1.0, 1.0]), float)
+
 # HOME_TIME = float(CFG["home"]["time"])
 # HOME_Q = list(CFG["home"]["q"])
 
@@ -71,11 +86,49 @@ def srdf_path():
     """Path to the MoveIt SRDF, used to disable allowed collision pairs."""
     return CFG["srdf"]
 
+class OneEuroFilter:
+    """3D one-euro filter: low lag in motion, smooths jitter at rest."""
+    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev = None
+        self.t_prev = None
+        self.dx_prev = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+    
+    def __call__(self, x, t):
+        x = np.asarray(x, float)
+        if self.t_prev is None:
+            self.t_prev = t
+            self.x_prev = x
+            self.dx_prev = np.zeros_like(x)
+            return x
+        dt = t - self.t_prev
+        if dt <= 0.0:
+            return self.x_prev
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * float(np.linalg.norm(dx_hat))
+        a = self._alpha(cutoff, dt)
+        x_hat = a * x + (1.0 - a) * self.x_prev
+        self.t_prev = t
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        return x_hat
+
 class PinkIK:
     """Pinocchio model + Pink differential IK for the SO-100 arm with self-collision checking."""
-    def __init__(self, urdf_path, ee_frame, arm_joints, gripper_joint=None, position_cost=POSITION_COST, orientation_cost=ORIENTATION_COST,lm_damping=LM_DAMPING, gain=TASK_GAIN, posture_cost=POSTURE_COST, vel_scale=VEL_SCALE, solver=None, srdf_path=None, package_dirs=None, collision_margin=COLLISION_MARGIN):
-        """Build the gripper-locked model and collision geometry, set up frame/posture tasks, 
+    def __init__(self, urdf_path, ee_frame, arm_joints, gripper_joint=None, position_cost=POSITION_COST, orientation_cost=ORIENTATION_COST,lm_damping=LM_DAMPING, gain=TASK_GAIN, posture_cost=POSTURE_COST, vel_scale=VEL_SCALE, solver=None, srdf_path=None, package_dirs=None, collision_margin=COLLISION_MARGIN, collision_mode=COLLISION_MODE, logger=None):
+        """Build the gripper-locked model and collision geometry, set up frame/posture tasks,
         joint limits and the QP solver."""
+        self.log = logger
+        self.collision_mode = collision_mode
         full = pin.buildModelFromUrdf(urdf_path)
         locked = []
         keep = set(arm_joints)
@@ -87,16 +140,29 @@ class PinkIK:
             if locked:
                 self.model, self.geom = pin.buildReducedModel(full, geom_full, locked, pin.neutral(full))
             else:
-                self.model,self.geom = full, geom_full
+                self.model, self.geom = full, geom_full
             self.geom.addAllCollisionPairs()
             pin.removeCollisionPairs(self.model, self.geom, srdf_path, False)
+            arm_jids = {self.model.getJointId(j) for j in arm_joints}
+            mv = lambda gi: self.geom.geometryObjects[gi].parentJoint in arm_jids
+            keep_pairs = [pin.CollisionPair(cp.first, cp.second)
+                          for cp in self.geom.collisionPairs if mv(cp.first) or mv(cp.second)]
+            n_before = len(self.geom.collisionPairs)
+            self.geom.removeAllCollisionPairs()
+            for cp in keep_pairs:
+                self.geom.addCollisionPair(cp)
+            if logger is not None:
+                logger.info(f"collision pairs: {n_before} -> {len(self.geom.collisionPairs)}")
             self.geom_data = self.geom.createData()
-            for req in self.geom_data.collisionRequests:
-                req.security_margin = float(collision_margin)
+            for k in range(len(self.geom_data.collisionRequests)):
+                self.geom_data.collisionRequests[k].security_margin = float(collision_margin)
             self.col_data = self.model.createData()
         else:
-            self.model = pin.buildReducedModel(full, locked, pin.neutral(full)) if locked else full 
+            self.model = pin.buildReducedModel(full, locked, pin.neutral(full)) if locked else full
         self.data = self.model.createData()
+        if self.model.nq != self.model.nv and logger is not None:
+            logger.warn(f"model.nq={self.model.nq} != nv={self.model.nv}: continuous joints present; "
+                        "scalar q-indexing and clipping may be wrong — review before hardware")
         if not self.model.existFrame(ee_frame):
             raise ValueError(f"EE frame '{ee_frame}' not found in URDF")
         self.ee = ee_frame
@@ -111,7 +177,7 @@ class PinkIK:
         self.limits = [ConfigurationLimit(self.model), VelocityLimit(self.model)]
 
     def fix_limits(self, vel_scale):
-        """Replace non-finite position/velocity limits, apply extra per-joint clamps from RLIMITS, 
+        """Replace non-finite position/velocity limits, apply extra per-joint clamps from RLIMITS,
         and scale velocity limits."""
         lo = np.array(self.model.lowerPositionLimit, float)
         hi = np.array(self.model.upperPositionLimit, float)
@@ -127,12 +193,12 @@ class PinkIK:
         vl[~np.isfinite(vl) | (vl <= 0)] = np.pi
         self.model.velocityLimit = vl * float(vel_scale)
 
-    def in_collision(self,q):
+    def in_collision(self, q, report=False):
         """Return True if configuration q is in self-collision (False when no geometry is loaded)."""
         if self.geom is None:
             return False
         hit = bool(pin.computeCollisions(self.model, self.col_data, self.geom, self.geom_data, np.asarray(q, float), False))
-        if hit:
+        if hit and report and self.log is not None:
             pairs = set()
             for k in range(len(self.geom.collisionPairs)):
                 if self.geom_data.collisionResults[k].isCollision():
@@ -140,7 +206,7 @@ class PinkIK:
                     pairs.add(self.geom.geometryObjects[cp.first].name + " <-> " + self.geom.geometryObjects[cp.second].name)
             key = tuple(sorted(pairs))
             if key != getattr(self, "_last_coll", None):
-                print("[COLLISION]", " ; ".join(key))
+                self.log.info("collision: " + " ; ".join(key), throttle_duration_sec=1.0)
                 self._last_coll = key
         return hit
 
@@ -176,32 +242,51 @@ class PinkIK:
         self.posture.set_target(self.configuration.q)
 
     def step(self, target_pos, target_R, dt=DT):
-        """One diff-IK step toward (target_pos, target_R): solve, clamp to limits, 
-        reject on collision, return new arm positions."""
+        """One diff-IK step toward (target_pos, target_R): solve, clamp to limits,
+        handle collision per mode (reanchor rejects, slide line-searches), return new arm positions."""
         T = pin.SE3(np.asarray(target_R, float), np.asarray(target_pos, float))
         self.ee_task.set_target(T)
         q_prec = self.configuration.q.copy()
-        q_new = q_prec
+        lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
+        v = np.zeros(self.model.nv)
         try:
-            v = solve_ik(self.configuration, [self.ee_task, self.posture], dt, solver=self.solver, limits=self.limits, safety_break=False)
-            q_new = pin.integrate(self.model, q_prec, v*dt)
+            v = solve_ik(self.configuration, [self.ee_task, self.posture], dt,
+                         solver=self.solver, limits=self.limits, safety_break=False)
         except Exception as exc:
-            print(f"[ik] solve skipped: {exc}")
-        q_new = np.clip(q_new, self.model.lowerPositionLimit, self.model.upperPositionLimit)
-        self.blocked = self.in_collision(q_new)
-        if self.blocked:
-            q_new = q_prec
+            if self.log is not None:
+                self.log.warn(f"IK solve skipped: {exc}", throttle_duration_sec=2.0)
+        q_full = np.clip(pin.integrate(self.model, q_prec, v * dt), lo, hi)
+
+        if not np.isfinite(q_full).all():
+            q_new, self.blocked = q_prec, False
+        elif self.in_collision(q_full, report=True):
+            if self.collision_mode == "slide":
+                a_lo, a_hi = 0.0, 1.0
+                for _ in range(8):
+                    mid = 0.5 * (a_lo + a_hi)
+                    if self.in_collision(np.clip(pin.integrate(self.model, q_prec, v * dt * mid), lo, hi)):
+                        a_hi = mid
+                    else:
+                        a_lo = mid
+                q_new = np.clip(pin.integrate(self.model, q_prec, v * dt * a_lo), lo, hi)
+            else:
+                q_new = q_prec
+            self.blocked = True
+        else:
+            q_new, self.blocked = q_full, False
+
         if not np.array_equal(q_new, self.configuration.q):
-            self.configuration = Configuration(self.model, self.data, q_new)
+            self.configuration.update(q_new)
         return self.arm_positions()
 
 class Bridge(Node):
     """ROS2 node: HTC Vive controller -> Pink diff-IK -> SO-100 arm and gripper."""
     def __init__(self):
-        """Build IK, compute shoulder origin and reach-shell radii, 
+        """Build IK, compute shoulder origin and reach-shell radii,
         set up publishers/subscribers/timers and shared teleop state."""
         super().__init__("vive_so100_pink_bridge")
-        self.ik = PinkIK(URDF, EE_FRAME, ARM, srdf_path = srdf_path(), package_dirs = mesh_pkg_dirs())
+        self.ik = PinkIK(URDF, EE_FRAME, ARM, srdf_path=srdf_path(), package_dirs=mesh_pkg_dirs(),
+                         collision_mode=COLLISION_MODE, logger=self.get_logger())
         self.model = self.ik.model
         self.shoulder = self.shoulder_origin()
         mn,mx = self.reach_shell()
@@ -217,6 +302,7 @@ class Bridge(Node):
         self.grip = ActionClient(self, GripperCommand, GRIP_ACTION)
         self._grip_last = None
         self._held_since = None
+        self._trig_down_t = 0.0
         self._was_engaged = False
         self.Rc_ref = None
         self.R_anchor = None
@@ -224,7 +310,7 @@ class Bridge(Node):
         self.pos = 0
         self.eff = 0
         self.dbg = 0
-        self.shared = {"target": None, "home": None, "anchor": None, "ref": None, "engaged": False, "ready": False, "trig_last": 0.0, "Rc": np.eye(3)}
+        self.shared = {"target": None, "home": None, "anchor": None, "ref": None, "engaged": False, "ready": False, "Rc": np.eye(3)}
         self._cur = None
         self._R_ref = np.eye(3)
         self._pad_was = False
@@ -233,6 +319,13 @@ class Bridge(Node):
         self._menu_now = False
         self._trig_now = 0.0
         self.mark = False
+        self._pose_t = 0.0
+        self._pose_lost = False
+        self._js_t = 0.0
+        self._R_des_prev = None
+        self._blend_from = None
+        self._blend_n = 0
+        self._pos_filter = OneEuroFilter(FILTER_MIN_CUTOFF, FILTER_BETA)
         self.create_subscription(Float64MultiArray, "/vive/pose", self.on_vive_pose, 10)
         self.create_subscription(Float64MultiArray, "/vive/buttons", self.on_vive_buttons, 10)
         self.get_logger().info("Bridge up. Waiting for robot...")
@@ -245,9 +338,9 @@ class Bridge(Node):
         pin.updateFramePlacements(self.model, fk_data)
         jid = self.model.getJointId("left_shoulder_lift_joint")
         return fk_data.oMi[jid].translation.copy()
-    
+
     def reach_shell(self, n=60000, seed=0):
-        """Monte-Carlo sample the first three joints to estimate min/max EE distance 
+        """Monte-Carlo sample the first three joints to estimate min/max EE distance
         from the shoulder (reach envelope)."""
         rng = np.random.default_rng(seed)
         lo_lim = self.model.lowerPositionLimit
@@ -257,26 +350,32 @@ class Bridge(Node):
         lo_d, hi_d = 1e9, 0.0
         samples = rng.uniform([lo_lim[i] for i in qidx], [hi_lim[i] for i in qidx], size=(n, 3))
         fk_data = self.model.createData()
+        fid = self.model.getFrameId(EE_FRAME)
         for s in samples:
             for k, i in enumerate(qidx):
                 q[i] = s[k]
             pin.forwardKinematics(self.model, fk_data, q)
             pin.updateFramePlacements(self.model, fk_data)
-            d = np.linalg.norm(fk_data.oMf[self.model.getFrameId(EE_FRAME)].translation - self.shoulder)
+            d = np.linalg.norm(fk_data.oMf[fid].translation - self.shoulder)
             lo_d = min(lo_d, d)
             hi_d = max(hi_d, d)
         return lo_d, hi_d
 
     def on_vive_pose(self, msg):
-        """Poll the VR controller: move the target inside the reach shell while engaged, 
-        toggle clutch on trackpad, mark on menu, latch trigger for the gripper."""
         d = msg.data
         if len(d) < 12:
             return
-        self._cur = np.array([d[0], d[1], d[2]], float)
-        self.shared["Rc"] = np.array([[d[3], d[4], d[5]],
-                                    [d[6], d[7], d[8]],
-                                    [d[9], d[10], d[11]]], float)
+        arr = np.asarray(d[:12], float)
+        if not np.isfinite(arr).all():
+            return
+        Rc = arr[3:].reshape(3, 3)
+        U, _, Vt = np.linalg.svd(Rc)
+        Rc = U @ Vt
+        if np.linalg.det(Rc) < 0.0:
+            Rc[:, -1] *= -1.0
+        self._pose_t = time.monotonic()
+        self._cur = self._pos_filter(arr[:3], self._pose_t)
+        self.shared["Rc"] = Rc
 
     def on_vive_buttons(self, msg):
         d = msg.data
@@ -285,7 +384,7 @@ class Bridge(Node):
         self._trig_now = float(d[0])
         self._pad_now = d[1] > 0.5
         self._menu_now = d[2] > 0.5
-    
+
     def _yaw_frame(self, Rc):
         """Heading-only frame from the controller orientation: horizontal forward/right + true up.
         Makes the position mapping robust to how the controller is pitched/rolled at engage."""
@@ -300,41 +399,90 @@ class Bridge(Node):
         right = right / np.linalg.norm(right)
         return np.column_stack([right, up, back_h])
 
+    def _capture_refs(self):
+        """Anchor ALL refs (position + orientation) to the current controller pose and current EE.
+        Used at engage and on recovery after a pose dropout."""
+        if self._cur is None:
+            return
+        self.shared["ref"] = self._cur.copy()
+        self._R_ref = self._yaw_frame(self.shared["Rc"])
+        self.shared["anchor"] = self.shared["target"].copy()
+        self.Rc_ref = self.shared["Rc"].copy()
+        self.R_anchor = self.ik.fk_rotation()
+        self._R_des_prev = self.R_anchor.copy()
+
+    def _ori_step(self, R_target):
+        """Exponential smoothing of the desired orientation toward R_target + per-tick angular-step cap."""
+        R_target = np.asarray(R_target, float)
+        if self._R_des_prev is None:
+            self._R_des_prev = R_target.copy()
+            return self._R_des_prev
+        R_prev = self._R_des_prev
+        w = ORI_ALPHA * pin.log3(R_target @ R_prev.T)
+        ang = float(np.linalg.norm(w))
+        if ang > MAX_ANG_STEP and ang > 1e-9:
+            w = w * (MAX_ANG_STEP / ang)
+        R_new = pin.exp3(w) @ R_prev
+        self._R_des_prev = R_new
+        return R_new
+
     def vr_tick(self):
         cur = self._cur
-        if cur is not None and self.shared["ready"] and self.shared["engaged"]:
-            dl = self._R_ref.T @ (cur - self.shared["ref"])
-            d = dl[AXIS_MAP]
-            off = SCALE * AXIS_SIGN * d
-            newp =  self.shared["anchor"] + off
-            arel = self.shared["anchor"] - self.shoulder
-            rel0 = newp - self.shoulder
-            az0 = np.arctan2(arel[1],arel[0])
-            az = np.arctan2(rel0[1],rel0[0])
-            daz = (az - az0 + np.pi) % (2*np.pi) - np.pi
-            naz = az0 + AZ_GAIN * daz
-            rh = np.hypot(rel0[0],rel0[1])
-            newp = self.shoulder + np.array([rh * np.cos(naz), rh * np.sin(naz), rel0[2]])
-            rel = newp - self.shoulder
-            r = np.linalg.norm(rel)
-            if r < 1e-6:
-                newp = self.shared["target"]
-            elif r > self.r_max:
-                newp = self.shoulder + rel * (self.r_max / r)
-            elif r < self.r_min:
-                newp = self.shoulder + rel * (self.r_min / r)
-            self.shared["target"] = newp
+        now = time.monotonic()
+        fresh = cur is not None and (now - self._pose_t) < POSE_TIMEOUT
+
+        if self.shared["ready"] and self.shared["engaged"]:
+            if not fresh:
+                if not self._pose_lost:
+                    self._pose_lost = True
+                    self.get_logger().warn("pose stale -> target frozen", throttle_duration_sec=1.0)
+            else:
+                if self._pose_lost:
+                    self._pose_lost = False
+                    self._capture_refs()
+                    self.get_logger().warn("pose recovered -> re-anchored")
+                dl = self._R_ref.T @ (cur - self.shared["ref"])
+                d = dl[AXIS_MAP]
+                off = SCALE * AXIS_SIGN * d
+                newp = self.shared["anchor"] + off
+                arel = self.shared["anchor"] - self.shoulder
+                rel0 = newp - self.shoulder
+                az0 = np.arctan2(arel[1], arel[0])
+                az = np.arctan2(rel0[1], rel0[0])
+                daz = (az - az0 + np.pi) % (2 * np.pi) - np.pi
+                naz = az0 + AZ_GAIN * daz
+                rh = np.hypot(rel0[0], rel0[1])
+                if rh > 1e-3:                               
+                    newp = self.shoulder + np.array([rh * np.cos(naz), rh * np.sin(naz), rel0[2]])
+                rel = newp - self.shoulder
+                r = np.linalg.norm(rel)
+                if r < 1e-6:
+                    newp = self.shared["target"]
+                elif r > self.r_max:
+                    newp = self.shoulder + rel * (self.r_max / r)
+                elif r < self.r_min:
+                    newp = self.shoulder + rel * (self.r_min / r)
+                prev = self.shared["target"]
+                stepv = newp - prev
+                sn = np.linalg.norm(stepv)
+                if sn > MAX_TARGET_STEP:
+                    newp = prev + stepv * (MAX_TARGET_STEP / sn)
+                ee = self.ik.fk_translation()
+                lead = newp - ee
+                ln = np.linalg.norm(lead)
+                if ln > MAX_LEAD:
+                    newp = ee + lead * (MAX_LEAD / ln)
+                self.shared["target"] = newp
 
         pad = self._pad_now
         menu = self._menu_now
-        trig = self._trig_now
         if pad and not self._pad_was:
-            if self.shared["ready"] and cur is not None:
+            if self.shared["ready"] and fresh:
                 if not self.shared["engaged"]:
-                    self.shared["ref"] = cur.copy()
-                    self._R_ref = self._yaw_frame(self.shared["Rc"])
-                    self.shared["anchor"] = self.shared["target"].copy()
                     self.shared["engaged"] = True
+                    self._pose_lost = False
+                    self._blend_n = 0
+                    self._capture_refs()
                     self.get_logger().info("ENGAGED")
                 else:
                     self.shared["engaged"] = False
@@ -345,9 +493,6 @@ class Bridge(Node):
             self.mark = not self.mark
             self.get_logger().info(f"RECORD {'ON' if self.mark else 'OFF'}")
         self._menu_was = menu
-
-        if trig > 0.5:
-            self.shared["trig_last"] = time.monotonic()
 
     def send_arm(self, positions):
         """Publish arm joint positions to the arm controller."""
@@ -367,6 +512,7 @@ class Bridge(Node):
     def send_grip(self, pos):
         """Send a gripper position goal via the action client; no-op if the server is not ready."""
         if not self.grip.server_is_ready():
+            self.get_logger().warn("gripper action server not ready", throttle_duration_sec=2.0)
             return False
         goal = GripperCommand.Goal()
         goal.command.position = float(pos)
@@ -376,6 +522,7 @@ class Bridge(Node):
 
     def on_joint_states(self, msg):
         """Cache measured joint positions/efforts and start homing once all arm joints are known."""
+        self._js_t = time.monotonic()
         nm = dict(zip(msg.name, msg.position))
         self.pos = nm
         self.eff = dict(zip(msg.name, msg.effort)) if msg.effort else {}
@@ -395,18 +542,17 @@ class Bridge(Node):
             self.get_logger().info("Teleop ready. Click trackpad to engage.")
 
     def tick(self):
-        """Main 100 Hz loop: home the arm, then run diff-IK toward the VR target and drive arm and gripper."""
+        """Main 100 Hz loop: run diff-IK toward the VR target, handle collision (Variant A reanchor),
+        blend on disengage, watchdog /joint_states, and drive arm and gripper."""
         if self.phase != "teleop":
             return
-        
         tgt = self.shared["target"].copy()
         Rc = self.shared["Rc"].copy()
         engaged = self.shared["engaged"]
 
-        if engaged and not self._was_engaged:
-            self.Rc_ref = Rc.copy()
-            self.R_anchor = self.ik.fk_rotation()
         if (not engaged) and self._was_engaged and all(j in self.pos for j in ARM):
+            self._blend_from = self.ik.arm_positions().copy()
+            self._blend_n = BLEND_TICKS
             q_hold = self.ik.neutral()
             for name in ARM:
                 q_hold[self.ik.qindex(name)] = self.pos[name]
@@ -416,39 +562,37 @@ class Bridge(Node):
         self._was_engaged = engaged
 
         if engaged and self.Rc_ref is not None:
-            dR = M @ (Rc @ self.Rc_ref.T) @ M.T
-            R_des = dR @ self.R_anchor
+            w = ORI_SIGN * pin.log3(M @ (Rc @ self.Rc_ref.T) @ M.T)
+            R_des = pin.exp3(w) @ self.R_anchor
         else:
             R_des = self.ik.fk_rotation()
+        R_des = self._ori_step(R_des)
 
         q_arm = self.ik.step(tgt, R_des, DT)
-        self.dbg += 1
-        if self.dbg % 50 == 0:
-            print("blocked=%s" % self.ik.blocked)
-            for i,j in enumerate(ARM):
-                cmd = float(q_arm[i])
-                meas = self.pos.get(j)
-                eff = self.eff.get(j)
-                ms = "n/a" if meas is None else "%+.4f" % meas
-                gs = "n/a" if meas is None else "%+.4f" % (cmd - meas)
-                es = "n/a" if eff is None else "%+.3f" % eff
-                print("%-16s cmd=%+.4f meas=%s gap=%s eff=%s" % (j, cmd, ms, gs, es))
-        if self.ik.blocked:
-            self._blk += 1
-            if self._blk % 50 == 1:
-                self.get_logger().info("collision == block")
+
+        if self.ik.blocked and engaged and COLLISION_MODE == "reanchor":
+            self.shared["target"] = self.ik.fk_translation()
+            self._capture_refs()
+
+        if self._blend_n > 0 and self._blend_from is not None:
+            a = 1.0 - self._blend_n / float(BLEND_TICKS)
+            q_arm = (1.0 - a) * self._blend_from + a * q_arm
+            self._blend_n -= 1
+
+        if (time.monotonic() - self._js_t) < JOINT_TIMEOUT:
+            self.send_arm(q_arm)
         else:
-            self._blk = 0
-        self.send_arm(q_arm)
+            self.get_logger().warn("joint_states stale -> arm command held", throttle_duration_sec=1.0)
 
         now = time.monotonic()
-        trig_last = self.shared["trig_last"]
-        held = (now - trig_last) < TRIG_TIMEOUT
-        if not held:
+        if self._trig_now > 0.5:
+            self._trig_down_t = now
+        down = (now - self._trig_down_t) < TRIG_TIMEOUT
+        if not down:
             self._held_since = None
         elif self._held_since is None:
             self._held_since = now
-        want = held and (now - self._held_since) >= TRIG_HOLD
+        want = down and (now - self._held_since) >= TRIG_HOLD
         if want != self._grip_last and self.send_grip(GRIP_CLOSE if want else GRIP_OPEN):
             self._grip_last = want
 

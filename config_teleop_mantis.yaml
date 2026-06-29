@@ -1,45 +1,56 @@
 ---
 
-urdf: /home/ros/share/mantis_ws/mantis.urdf
-srdf: /home/ros/share/mantis_ws/mantis.srdf
-ee_frame: left_tool0
-arm: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint, left_wrist_1_joint,left_wrist_2_joint,left_wrist_3_joint]
-arm_cmd_joints: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint, left_wrist_1_joint,left_wrist_2_joint,left_wrist_3_joint,right_shoulder_pan_joint, right_shoulder_lift_joint, right_elbow_joint, right_wrist_1_joint,right_wrist_2_joint,right_wrist_3_joint]
-gripper_joint: ""
+urdf: /home/ros/share/mantis_ws/mantis.urdf   # robot URDF (kinematics + collision geometry)
+srdf: /home/ros/share/mantis_ws/mantis.srdf   # MoveIt SRDF (allowed/disabled collision pairs)
+ee_frame: left_tool0                          # end-effector frame driven by IK
+arm: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint, left_wrist_1_joint,left_wrist_2_joint,left_wrist_3_joint]   # controlled (left) arm joints, IK order
+arm_cmd_joints: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint, left_wrist_1_joint,left_wrist_2_joint,left_wrist_3_joint,right_shoulder_pan_joint, right_shoulder_lift_joint, right_elbow_joint, right_wrist_1_joint,right_wrist_2_joint,right_wrist_3_joint]   # full published command vector order (left + right)
+gripper_joint: ""                             # unused (gripper driven via action server)
 
-rate: 100.0
+rate: 100.0                                   # main loop / diff-IK frequency (Hz)
 
 ik:
-  position_cost: 1.0
-  orientation_cost: 0.2
-  lm_damping: 0.001
-  task_gain: 0.8
-  posture_cost: 0.02
-  vel_scale: 0.9
-  collision_margin: 0.01
+  position_cost: 1.0          # FrameTask position tracking weight
+  orientation_cost: 0.3       # FrameTask orientation tracking weight
+  lm_damping: 0.001           # Levenberg-Marquardt damping (singularity robustness)
+  task_gain: 0.8              # task servo gain (0..1)
+  posture_cost: 0.02          # posture regularization weight (pulls toward neutral)
+  vel_scale: 0.9              # scale applied to model velocity limits (0..1)
+  collision_margin: 0.01      # self-collision security margin (m)
 
 teleop:
-  scale: 1.0
-  az_gain: 1.0
-  reach_lo_frac: 0.10
-  reach_hi_frac: 0.95
-  axis_sign: [-1.0, -1.0, 1.0]
-  axis_map: [2, 0, 1]
+  scale: 1.5                    # controller-to-robot position scale
+  az_gain: 1.0                  # azimuth gain (yaw around the shoulder)
+  reach_lo_frac: 0.10           # inner reach-shell radius as fraction of [min,max] reach
+  reach_hi_frac: 0.95           # outer reach-shell radius as fraction of [min,max] reach
+  axis_sign: [-1.0, -1.0, 1.0]  # per-axis sign for controller->robot mapping
+  axis_map: [2, 0, 1]           # controller->robot axis permutation
+  collision_mode: reanchor      # reanchor (A) | slide (B)
+  max_target_speed: 0.5         # m/s, target speed cap
+  max_lead: 0.05                # m, target lead over real EE
+  max_ang_speed: 2.0            # rad/s, orientation slew cap
+  ori_alpha: 0.6                # orientation smoothing (0..1, 1 = none)
+  ori_sign: [-1.0, 1.0, 1.0]    # per-axis orientation sense; flip a component to invert that rotation axis
+  filter_min_cutoff: 1.0        # one-euro min cutoff (Hz)
+  filter_beta: 0.007            # one-euro speed coefficient
+  pose_timeout: 0.2             # s, /vive/pose freshness watchdog
+  joint_timeout: 0.3            # s, /joint_states freshness watchdog
+  disengage_blend_ticks: 5      # ticks to blend command on disengage
 
-home:
-  time: 3.0
-  q: [0.0, -1.2, 1.5, -1.5, -1.57, 0.0]
+home:                           # unused (homing disabled in the node)
+  time: 3.0                     # homing duration (s)
+  q: [0.0, -1.2, 1.5, -1.5, -1.57, 0.0]   # home configuration (rad)
 
 gripper:
-  grip_open: 0.0
-  grip_close: 1.1
-  trig_timeout: 0.15
-  trig_hold: 0.15
-  effort: 5.0
-  action: /left_gripper_controller/gripper_cmd
+  grip_open: 0.0                # open position command
+  grip_close: 1.1               # closed position command
+  trig_timeout: 0.15            # s, trigger dropout-bridge window (also sets open lag)
+  trig_hold: 0.15               # s, trigger hold debounce before closing
+  effort: 5.0                   # gripper max effort
+  action: /left_gripper_controller/gripper_cmd   # gripper action server
 
 topics:
-  arm_cmd: /forward_position_controller/commands
-  joint_states: /joint_states
+  arm_cmd: /forward_position_controller/commands   # arm position command topic
+  joint_states: /joint_states                      # measured joint states topic
 
-rlimits: {}
+rlimits: {}                     # extra per-joint [lo, hi] clamps in rad; empty = none
