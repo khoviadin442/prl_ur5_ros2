@@ -145,8 +145,7 @@ class PinkIK:
             pin.removeCollisionPairs(self.model, self.geom, srdf_path, False)
             arm_jids = {self.model.getJointId(j) for j in arm_joints}
             mv = lambda gi: self.geom.geometryObjects[gi].parentJoint in arm_jids
-            keep_pairs = [pin.CollisionPair(cp.first, cp.second)
-                          for cp in self.geom.collisionPairs if mv(cp.first) or mv(cp.second)]
+            keep_pairs = [pin.CollisionPair(cp.first, cp.second) for cp in self.geom.collisionPairs if mv(cp.first) or mv(cp.second)]
             n_before = len(self.geom.collisionPairs)
             self.geom.removeAllCollisionPairs()
             for cp in keep_pairs:
@@ -250,8 +249,7 @@ class PinkIK:
         lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
         v = np.zeros(self.model.nv)
         try:
-            v = solve_ik(self.configuration, [self.ee_task, self.posture], dt,
-                         solver=self.solver, limits=self.limits, safety_break=False)
+            v = solve_ik(self.configuration, [self.ee_task, self.posture], dt, solver=self.solver, limits=self.limits, safety_break=False)
         except Exception as exc:
             if self.log is not None:
                 self.log.warn(f"IK solve skipped: {exc}", throttle_duration_sec=2.0)
