@@ -573,7 +573,7 @@ class Bridge(Node):
             self._capture_refs()
 
         if self._blend_n > 0 and self._blend_from is not None:
-            a = 1.0 - self._blend_n / float(BLEND_TICKS)
+            a = 1.0 - (self._blend_n - 1)/ float(BLEND_TICKS)
             q_arm = (1.0 - a) * self._blend_from + a * q_arm
             self._blend_n -= 1
 
@@ -583,9 +583,7 @@ class Bridge(Node):
             self.get_logger().warn("joint_states stale -> arm command held", throttle_duration_sec=1.0)
 
         now = time.monotonic()
-        if self._trig_now > 0.5:
-            self._trig_down_t = now
-        down = (now - self._trig_down_t) < TRIG_TIMEOUT
+        down = self._trig_now > 0.5
         if not down:
             self._held_since = None
         elif self._held_since is None:
@@ -593,7 +591,6 @@ class Bridge(Node):
         want = down and (now - self._held_since) >= TRIG_HOLD
         if want != self._grip_last and self.send_grip(GRIP_CLOSE if want else GRIP_OPEN):
             self._grip_last = want
-
 
 def main():
     """Init rclpy, spin the Bridge node, shut down VR and ROS cleanly."""
@@ -606,7 +603,6 @@ def main():
     finally:
         node.destroy_node()
         rclpy.ok() and rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
