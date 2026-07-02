@@ -7,7 +7,7 @@ arm: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint, left_
 arm_cmd_joints: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint, left_wrist_1_joint,left_wrist_2_joint,left_wrist_3_joint,right_shoulder_pan_joint, right_shoulder_lift_joint, right_elbow_joint, right_wrist_1_joint,right_wrist_2_joint,right_wrist_3_joint]   # full published command vector order (left + right)
 gripper_joint: ""                             # unused (gripper driven via action server)
 
-rate: 100.0                                   # main loop / diff-IK frequency (Hz)
+rate: 100.0                                    # main loop / diff-IK frequency (Hz); 100 Hz = 10 ms tick budget
 
 ik:
   position_cost: 1.0          # FrameTask position tracking weight
@@ -19,23 +19,32 @@ ik:
   collision_margin: 0.01      # self-collision security margin (m)
 
 teleop:
-  scale: 1.5                    # controller-to-robot position scale
+  scale: 1.2                   # controller-to-robot position scale
   az_gain: 1.0                  # azimuth gain (yaw around the shoulder)
   reach_lo_frac: 0.10           # inner reach-shell radius as fraction of [min,max] reach
-  reach_hi_frac: 0.95           # outer reach-shell radius as fraction of [min,max] reach
+  reach_hi_frac: 1.0           # outer reach-shell radius as fraction of [min,max] reach
   axis_sign: [-1.0, -1.0, 1.0]  # per-axis sign for controller->robot mapping
   axis_map: [2, 0, 1]           # controller->robot axis permutation
-  collision_mode: reanchor      # reanchor (A) | slide (B)
-  max_target_speed: 0.5         # m/s, target speed cap
-  max_lead: 0.05                # m, target lead over real EE
+  collision_mode: reanchor      # legacy, used only when collision_barrier=false: reanchor (A) | slide (B)
+  max_target_speed: 5.0         # m/s, target speed cap
+  max_lead: 0.03               # m, target leash: cap target distance ahead of real EE (always active; anti-windup)
+  max_ang_lead: 0.15           # rad, angular analog of max_lead: cap between desired and actual EE orientation
   max_ang_speed: 2.0            # rad/s, orientation slew cap
   ori_alpha: 0.6                # orientation smoothing (0..1, 1 = none)
-  ori_sign: [-1.0, 1.0, 1.0]    # per-axis orientation sense; flip a component to invert that rotation axis
+  ori_sign: [1.0, 1.0, 1.0]    # per-axis orientation sense; flip a component to invert that rotation axis
   filter_min_cutoff: 1.0        # one-euro min cutoff (Hz)
   filter_beta: 0.007            # one-euro speed coefficient
   pose_timeout: 0.2             # s, /vive/pose freshness watchdog
   joint_timeout: 0.3            # s, /joint_states freshness watchdog
   disengage_blend_ticks: 5      # ticks to blend command on disengage
+  collision_barrier: true        # true = CBF self-collision barrier in the QP (collision_mode no longer used)
+  d_influence: 0.04             # m, gap below which _near_collision() flags "near" (indicator only; not a barrier param in Pink 4.2)
+  d_min: 0.010                   # m, barrier minimum gap (hard floor kept by the CBF)
+  barrier_gain: 10.0             # CBF gain; brake distance ~= v/gain (0.3 m/s -> ~0.10 m)
+  barrier_safe_gain: 1.0        # safe-displacement gain; with zero safe_displacement this is only a dq->0 damper
+  self_collision_min_hops: 2    # keep intra-arm pairs only if joints-between >= this; drops structural neighbors (<=2 apart)
+  drop_dist_thresh: 0.1        # m, at startup drop INTER-group pairs whose neutral gap < max(2*d_min, this)
+  n_collision_pairs: 16        # K closest pairs the barrier evaluates; 0 = ALL pairs after funnel (overshoot test)
 
 home:                           # unused (homing disabled in the node)
   time: 3.0                     # homing duration (s)

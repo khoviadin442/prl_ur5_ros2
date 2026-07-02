@@ -11,9 +11,11 @@ from control_msgs.action import GripperCommand
 from rclpy.action import ActionClient
 from std_msgs.msg import Float64MultiArray
 from pink import Configuration, solve_ik
+from pink.exceptions import PinkError
 from pink.tasks import FrameTask, PostureTask
 from pink.limits import ConfigurationLimit, VelocityLimit
 from ament_index_python.packages import get_package_share_directory
+from scipy.spatial import ConvexHull
 
 path = os.environ.get("teleop_config", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_teleop_mantis.yaml"))
 with open(path) as f:
@@ -50,6 +52,7 @@ for i in range(3):
 COLLISION_MODE   = CFG["teleop"].get("collision_mode", "reanchor")
 MAX_TARGET_SPEED = float(CFG["teleop"].get("max_target_speed", 0.5))
 MAX_LEAD         = float(CFG["teleop"].get("max_lead", 0.05))
+MAX_ANG_LEAD     = float(CFG["teleop"].get("max_ang_lead", 0.15))
 MAX_ANG_SPEED    = float(CFG["teleop"].get("max_ang_speed", 2.0))
 ORI_ALPHA        = float(CFG["teleop"].get("ori_alpha", 0.6))
 FILTER_MIN_CUTOFF= float(CFG["teleop"].get("filter_min_cutoff", 1.0))
@@ -61,6 +64,16 @@ VR_DT            = 1.0 / 250.0
 MAX_TARGET_STEP  = MAX_TARGET_SPEED * VR_DT
 MAX_ANG_STEP     = MAX_ANG_SPEED * DT
 ORI_SIGN         = np.array(CFG["teleop"].get("ori_sign", [1.0, 1.0, 1.0]), float)
+COLLISION_BARRIER = bool(CFG["teleop"].get("collision_barrier", True))
+D_INFLUENCE       = float(CFG["teleop"].get("d_influence", 0.04))
+D_MIN             = float(CFG["teleop"].get("d_min", 0.01))
+BARRIER_GAIN      = float(CFG["teleop"].get("barrier_gain", 100.0))
+BARRIER_SAFE_GAIN = float(CFG["teleop"].get("barrier_safe_gain", 1.0))
+SELF_MIN_HOPS     = int(CFG["teleop"].get("self_collision_min_hops", 3))
+DROP_DIST_THRESH  = float(CFG["teleop"].get("drop_dist_thresh", 0.03))
+N_COLLISION_PAIRS = int(CFG["teleop"].get("n_collision_pairs", 40))
+DIAG_NEAR = 0.025
+DIAG_DUMP_PERIOD = 10.0 
 
 # HOME_TIME = float(CFG["home"]["time"])
 # HOME_Q = list(CFG["home"]["q"])
@@ -136,22 +149,153 @@ class PinkIK:
         self.geom = None
         self.blocked = False
         if srdf_path and package_dirs:
-            geom_full = pin.buildGeomFromUrdf(full, urdf_path, pin.GeometryType.COLLISION, package_dirs=list(package_dirs))
+            try:
+                geom_full = pin.buildGeomFromUrdf(full, urdf_path, pin.GeometryType.COLLISION, package_dirs=list(package_dirs))
+            except Exception as e:
+                if logger is not None:
+                    logger.error(f"COLLISION GEOM FAILED({e}) -> collision DISABLED")
+                raise RuntimeError("collision geometry failed to load - refusing to run without collision protection")
+            self.geom = None
             if locked:
                 self.model, self.geom = pin.buildReducedModel(full, geom_full, locked, pin.neutral(full))
             else:
                 self.model, self.geom = full, geom_full
+            try:
+                import coal as fcl
+            except Exception:
+                import hppfcl as fcl
+            from scipy.spatial import ConvexHull
+            n_hull = 0
+            failed_links = []
+            for go in self.geom.geometryObjects:
+                g = go.geometry
+                if not isinstance(g, fcl.BVHModelBase):
+                    continue
+                if go.name == "table_link_0":
+                    continue
+                try:
+                    V = np.asarray(g.vertices())
+                    n_before = len(V)
+                    hull = ConvexHull(V)
+                    used = np.unique(np.concatenate([hull.vertices, hull.simplices.ravel()]))
+                    remap = {int(old): new for new, old in enumerate(used)}
+                    pv = fcl.StdVec_Vec3s()
+                    for p in V[used]:
+                        pv.append(np.asarray(p, float))
+                    tris = fcl.StdVec_Triangle()
+                    for s in hull.simplices:
+                        tris.append(fcl.Triangle(remap[int(s[0])], remap[int(s[1])], remap[int(s[2])]))
+                    go.geometry = fcl.Convex(pv, tris)
+                    n_after = go.geometry.num_points
+                    n_hull += 1
+                    if logger is not None:
+                        logger.info(f"hull {go.name}: {n_before} -> {n_after}")
+                        if n_after >= n_before:
+                            logger.warn(f"hull {go.name}: NOT reduced ({n_before} -> {n_after}) - possible reuse/degenerate")
+                except Exception as e:
+                    failed_links.append(go.name)
+                    if logger is not None:
+                        logger.error(f"hull FAILED for {go.name} ({e}) -> link distance-UNSAFE, left as raw BVH")
+            if logger is not None:
+                logger.info(f"built {n_hull} convex hulls")
+                if failed_links:
+                    logger.error(f"HULL FAILURES ({len(failed_links)}): {failed_links} -> these links left as raw BVH, self-collision distances unreliable")
+            for _gid, _go in enumerate(self.geom.geometryObjects):
+                if _go.name != "table_link_0":
+                    continue
+                try:
+                    _go.geometry.computeLocalAABB()
+                    _al = _go.geometry.aabb_local
+                    _mn = np.array(_al.min_); _mx = np.array(_al.max_)
+                    _d = self.model.createData(); _gd = self.geom.createData()
+                    pin.updateGeometryPlacements(self.model, _d, self.geom, _gd, pin.neutral(self.model))
+                    _oMg = _gd.oMg[_gid]
+                    _corners = np.array([[x, y, z] for x in (_mn[0], _mx[0]) for y in (_mn[1], _mx[1]) for z in (_mn[2], _mx[2])])
+                    _wc = (_oMg.rotation @ _corners.T).T + _oMg.translation
+                    _wmin = _wc.min(0); _wmax = _wc.max(0)
+                    _sx = float(_wmax[0] - _wmin[0]) + 0.02
+                    _sy = float(_wmax[1] - _wmin[1]) + 0.02
+                    _sz = 0.10
+                    _top = float(_wmax[2])
+                    _center = np.array([0.5 * (_wmin[0] + _wmax[0]), 0.5 * (_wmin[1] + _wmax[1]), _top - 0.5 * _sz])
+                    _Rw = _oMg.rotation.copy() if not np.allclose(_oMg.rotation, np.eye(3)) else np.eye(3)
+                    _oMj = _d.oMi[_go.parentJoint]
+                    _go.geometry = fcl.Box(_sx, _sy, _sz)
+                    _go.placement = _oMj.inverse() * pin.SE3(_Rw, _center)
+                    if logger is not None:
+                        logger.info(f"table override: Convex -> Box size={[round(_sx,3), round(_sy,3), round(_sz,3)]} center={[round(float(_center[0]),3), round(float(_center[1]),3), round(float(_center[2]),3)]}")
+                except Exception as e:
+                    if logger is not None:
+                        logger.warn(f"table override skipped: {e}")
+                break
             self.geom.addAllCollisionPairs()
             pin.removeCollisionPairs(self.model, self.geom, srdf_path, False)
             arm_jids = {self.model.getJointId(j) for j in arm_joints}
-            mv = lambda gi: self.geom.geometryObjects[gi].parentJoint in arm_jids
-            keep_pairs = [pin.CollisionPair(cp.first, cp.second) for cp in self.geom.collisionPairs if mv(cp.first) or mv(cp.second)]
-            n_before = len(self.geom.collisionPairs)
-            self.geom.removeAllCollisionPairs()
-            for cp in keep_pairs:
-                self.geom.addCollisionPair(cp)
+            on_arm = lambda gi: self.geom.geometryObjects[gi].parentJoint in arm_jids
+            both_on_arm = lambda cp: on_arm(cp.first) and on_arm(cp.second)
             if logger is not None:
-                logger.info(f"collision pairs: {n_before} -> {len(self.geom.collisionPairs)}")
+                for i, go in enumerate(self.geom.geometryObjects):
+                    logger.info(f"geom[{i}] {go.name} type={type(go.geometry).__name__} joint={go.parentJoint}")
+                for cp in self.geom.collisionPairs:
+                    a = self.geom.geometryObjects[cp.first].name
+                    b = self.geom.geometryObjects[cp.second].name
+                    logger.info(f"PAIR {a} <-> {b}")
+            def _hops(a, b):
+                """Number of joints between joint ids a and b in the kinematic tree."""
+                chain = []
+                x = a
+                while True:
+                    chain.append(x)
+                    if x == 0:
+                        break
+                    x = self.model.parents[x]
+                depth = {j: i for i, j in enumerate(chain)}
+                db, x = 0, b
+                while x not in depth:
+                    x = self.model.parents[x]
+                    db += 1
+                return depth[x] + db
+
+            n0 = len(self.geom.collisionPairs)
+            pairs = [pin.CollisionPair(cp.first, cp.second) for cp in self.geom.collisionPairs if on_arm(cp.first) or on_arm(cp.second)]
+            n_moving = len(pairs)
+
+            def _struct_neighbor(cp):
+                if not both_on_arm(cp):
+                    return False
+                ja = self.geom.geometryObjects[cp.first].parentJoint
+                jb = self.geom.geometryObjects[cp.second].parentJoint
+                return _hops(ja, jb) < SELF_MIN_HOPS
+            pairs = [cp for cp in pairs if not _struct_neighbor(cp)]
+            n_topo = len(pairs)
+
+            self.geom.removeAllCollisionPairs()
+            for cp in pairs:
+                self.geom.addCollisionPair(cp)
+            _gd = self.geom.createData()
+            _tmp_cfg = Configuration(self.model, self.model.createData(), pin.neutral(self.model), collision_model=self.geom, collision_data=_gd)
+            _tmp_cfg.update(pin.neutral(self.model))
+            _dmins = [_gd.distanceResults[k].min_distance for k in range(len(self.geom.collisionPairs))]
+
+            _thresh = max(2.0 * D_MIN, DROP_DIST_THRESH)
+            _ENV_KW = ("table", "wall", "floor", "ground")
+            def _is_env(cp):
+                na = self.geom.geometryObjects[cp.first].name.lower()
+                nb = self.geom.geometryObjects[cp.second].name.lower()
+                return any(k in na or k in nb for k in _ENV_KW)
+            final_pairs = []
+            for k, cp in enumerate(self.geom.collisionPairs):
+                if (not both_on_arm(cp)) and (not _is_env(cp)) and _dmins[k] < _thresh:
+                    continue
+                final_pairs.append(pin.CollisionPair(cp.first, cp.second))
+
+            self.geom.removeAllCollisionPairs()
+            for cp in final_pairs:
+                self.geom.addCollisionPair(cp)
+            n_final = len(self.geom.collisionPairs)
+            if logger is not None:
+                logger.info(f"collision pairs funnel: all={n0} -> moving={n_moving} -> topo={n_topo} -> dist={n_final}")
+            
             self.geom_data = self.geom.createData()
             for k in range(len(self.geom_data.collisionRequests)):
                 self.geom_data.collisionRequests[k].security_margin = float(collision_margin)
@@ -159,9 +303,27 @@ class PinkIK:
         else:
             self.model = pin.buildReducedModel(full, locked, pin.neutral(full)) if locked else full
         self.data = self.model.createData()
+        try:
+            from pink.barriers import SelfCollisionBarrier
+            self._has_barrier = True
+            self._SCB = SelfCollisionBarrier
+        except Exception as e:
+            self._has_barrier = False
+            self._SCB = None
+            if logger is not None:
+                logger.error(f"pink.barriers unavailable ({e}) — collision barrier disabled, falling back to reject")
+        self.barrier = None
+        if COLLISION_BARRIER and self._has_barrier and self.geom is not None:
+            n_avail = len(self.geom.collisionPairs)
+            if n_avail > 0:
+                n_bar = n_avail if N_COLLISION_PAIRS <= 0 else min(N_COLLISION_PAIRS, n_avail)
+                self.barrier = self._SCB(n_bar, gain=BARRIER_GAIN, safe_displacement_gain=BARRIER_SAFE_GAIN, d_min=D_MIN)
+                if logger is not None:
+                    logger.info(f"SelfCollisionBarrier dim={n_bar} of {n_avail} pairs "f"(d_min={D_MIN}, d_infl={D_INFLUENCE} indicator-only)")
+            elif logger is not None:
+                logger.warn("collision_barrier on, but 0 collision pairs after filtering — barrier inactive")
         if self.model.nq != self.model.nv and logger is not None:
-            logger.warn(f"model.nq={self.model.nq} != nv={self.model.nv}: continuous joints present; "
-                        "scalar q-indexing and clipping may be wrong — review before hardware")
+            logger.warn(f"model.nq={self.model.nq} != nv={self.model.nv}: continuous joints present; ""scalar q-indexing and clipping may be wrong — review before hardware")
         if not self.model.existFrame(ee_frame):
             raise ValueError(f"EE frame '{ee_frame}' not found in URDF")
         self.ee = ee_frame
@@ -171,9 +333,20 @@ class PinkIK:
         self.solver = solver or ("daqp" if "daqp" in qpsolvers.available_solvers else qpsolvers.available_solvers[0])
         self.ee_task = FrameTask(ee_frame, position_cost=position_cost, orientation_cost=orientation_cost,lm_damping=lm_damping, gain=gain)
         self.posture = PostureTask(cost=posture_cost)
-        self.configuration = Configuration(self.model, self.data, pin.neutral(self.model))
+        if self.barrier is not None:
+            self.configuration = Configuration(self.model, self.data, pin.neutral(self.model), collision_model=self.geom, collision_data=self.geom_data)
+        else:
+            self.configuration = Configuration(self.model, self.data, pin.neutral(self.model))
         self.posture.set_target(self.configuration.q)
         self.limits = [ConfigurationLimit(self.model), VelocityLimit(self.model)]
+        self._diag_t0 = time.monotonic()
+        self._diag_prev_t = None
+        self._diag_last_dump = self._diag_t0
+        self._diag_near = {}
+        self._diag_retreats = 0
+        self._diag_retreats_last = 0
+        if self.geom is not None and self.log is not None:
+            self.log.info(f"DIAG collisionPairs={len(self.geom.collisionPairs)} (N_COLLISION_PAIRS={N_COLLISION_PAIRS}, d_min={D_MIN})")
 
     def fix_limits(self, vel_scale):
         """Replace non-finite position/velocity limits, apply extra per-joint clamps from RLIMITS,
@@ -237,45 +410,171 @@ class PinkIK:
 
     def reset_to(self, qf):
         """Reset the configuration to qf and re-anchor the posture target there."""
-        self.configuration = Configuration(self.model, self.data, np.asarray(qf, float))
+        if self.barrier is not None:
+            self.configuration = Configuration(self.model, self.data, np.asarray(qf, float), collision_model=self.geom, collision_data=self.geom_data)
+        else:
+            self.configuration = Configuration(self.model, self.data, np.asarray(qf, float))
         self.posture.set_target(self.configuration.q)
 
+    def _min_gap(self,q):
+        pin.computeDistances(self.model, self.col_data, self.geom, self.geom_data, np.asarray(q,float))
+        return min((self.geom_data.distanceResults[k].min_distance for k in range(len(self.geom.collisionPairs))), default = 1e9)
+
     def step(self, target_pos, target_R, dt=DT):
-        """One diff-IK step toward (target_pos, target_R): solve, clamp to limits,
-        handle collision per mode (reanchor rejects, slide line-searches), return new arm positions."""
+        """One diff-IK step toward (target_pos, target_R). The CBF barrier enforces the
+        collision gap as a hard QP inequality; on an infeasible/None/NaN solve we retreat
+        along the outward gradient of the closest pair instead of freezing."""
         T = pin.SE3(np.asarray(target_R, float), np.asarray(target_pos, float))
         self.ee_task.set_target(T)
         q_prec = self.configuration.q.copy()
         lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
-        v = np.zeros(self.model.nv)
-        try:
-            v = solve_ik(self.configuration, [self.ee_task, self.posture], dt, solver=self.solver, limits=self.limits, safety_break=False)
-        except Exception as exc:
-            if self.log is not None:
-                self.log.warn(f"IK solve skipped: {exc}", throttle_duration_sec=2.0)
-        q_full = np.clip(pin.integrate(self.model, q_prec, v * dt), lo, hi)
-
-        if not np.isfinite(q_full).all():
-            q_new, self.blocked = q_prec, False
-        elif self.in_collision(q_full, report=True):
-            if self.collision_mode == "slide":
-                a_lo, a_hi = 0.0, 1.0
-                for _ in range(8):
-                    mid = 0.5 * (a_lo + a_hi)
-                    if self.in_collision(np.clip(pin.integrate(self.model, q_prec, v * dt * mid), lo, hi)):
-                        a_hi = mid
-                    else:
-                        a_lo = mid
-                q_new = np.clip(pin.integrate(self.model, q_prec, v * dt * a_lo), lo, hi)
-            else:
+        if self.barrier is None:
+            try:
+                v = solve_ik(self.configuration, [self.ee_task, self.posture], dt, solver=self.solver, limits=self.limits, safety_break=False)
+            except Exception as exc:
+                v = np.zeros(self.model.nv)
+                if self.log is not None:
+                    self.log.warn(f"IK solve skipped: {exc}", throttle_duration_sec=2.0)
+            q_new = np.clip(pin.integrate(self.model, q_prec, v * dt), lo, hi)
+            if not np.isfinite(q_new).all():
                 q_new = q_prec
-            self.blocked = True
-        else:
-            q_new, self.blocked = q_full, False
+            if not np.array_equal(q_new, self.configuration.q):
+                self.configuration.update(q_new)
+            self._log_min_gap()
+            return self.arm_positions()
+
+        v = None
+        reason = None
+        try:
+            v = solve_ik(self.configuration, [self.ee_task, self.posture], dt, solver=self.solver, limits=self.limits, barriers=[self.barrier], safety_break=False)
+        except PinkError as exc:
+            reason = f"PinkError: {exc}"
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+        if v is None and reason is None:
+            reason = "solve_ik returned None"
+
+        q_new = None
+        if v is not None:
+            q_new = np.clip(pin.integrate(self.model, q_prec, v * dt), lo, hi)
+            if not np.isfinite(q_new).all():
+                reason = "non-finite q from IK"
+                q_new = None
+
+        if q_new is None:
+            self._diag_retreats += 1
+            if self.log is not None:
+                self.log.warn(f"IK(barrier) infeasible -> retreat ({reason})", throttle_duration_sec=1.0)
+            q_new = self._retreat(q_prec, dt)
 
         if not np.array_equal(q_new, self.configuration.q):
             self.configuration.update(q_new)
+        self.blocked = self._near_collision()
+        self._log_min_gap()
         return self.arm_positions()
+
+    def _retreat(self, q_prec, dt):
+        """Move away from the closest collision pair along the outward barrier gradient.
+        The gradient direction is checked at runtime against self._min_gap (probe step),
+        so the sign is chosen live rather than hard-coded. Logs the closest pair, the gap
+        before/after and the chosen sign. Holds at q_prec (restoring distanceResults to
+        q_prec, since step() skips configuration.update on a hold) if the step is non-finite
+        or would WORSEN the gap."""
+        lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
+        try:
+            h = self.barrier.compute_barrier(self.configuration)
+            J = self.barrier.compute_jacobian(self.configuration)
+            k = int(np.argmin(h))
+            g = J[k]
+            gn = float(np.linalg.norm(g))
+            kg = min(range(len(self.geom.collisionPairs)), key=lambda i: self.geom_data.distanceResults[i].min_distance)
+            _cp = self.geom.collisionPairs[kg]
+            pair_name = (self.geom.geometryObjects[_cp.first].name + "<->" + self.geom.geometryObjects[_cp.second].name)
+            if gn < 1e-9:
+                if self.log is not None:
+                    self.log.error(f"retreat gradient ~0 (pair {pair_name}) -> holding", throttle_duration_sec=1.0)
+                return q_prec
+            g = g / gn
+            g0 = self._min_gap(q_prec)
+            q_probe = np.clip(pin.integrate(self.model, q_prec, g * 1e-3), lo, hi)
+            sign = 1.0
+            if self._min_gap(q_probe) < g0:
+                g = -g
+                sign = -1.0
+            k_ret = 0.1 * float(np.max(self.model.velocityLimit))
+            v_ret = np.clip(k_ret * g, -self.model.velocityLimit, self.model.velocityLimit)
+            q_ret = np.clip(pin.integrate(self.model, q_prec, v_ret * dt), lo, hi)
+            if not np.isfinite(q_ret).all():
+                self._min_gap(q_prec)
+                if self.log is not None:
+                    self.log.error("retreat produced non-finite q -> holding", throttle_duration_sec=1.0)
+                return q_prec
+            g1 = self._min_gap(q_ret)
+            if self.log is not None:
+                self.log.warn(f"retreat pair={pair_name} sign={sign:+.0f}" f"gap {g0*1000:+.1f}->{g1*1000:+.1f} mm", throttle_duration_sec=0.5)
+            if g1 < g0:
+                self._min_gap(q_prec)
+                if self.log is not None:
+                    self.log.error(f"retreat worsened gap ({g0*1000:+.1f}->{g1*1000:+.1f} mm) -> holding", throttle_duration_sec=0.5)
+                return q_prec
+            return q_ret
+        except Exception as exc:
+            try:
+                self._min_gap(q_prec)
+            except Exception:
+                pass
+            if self.log is not None:
+                self.log.error(f"retreat failed ({exc}) -> holding", throttle_duration_sec=1.0)
+            return q_prec
+
+    def _log_min_gap(self):
+        """TEMP telemetry: min gap + closest pair, per-pair dwell below DIAG_NEAR, retreat rate."""
+        if self.geom is None or self.log is None:
+            return
+        try:
+            n = len(self.geom.collisionPairs)
+            if n == 0:
+                return
+            if getattr(self.configuration, "collision_data", None) is None:
+                pin.computeDistances(self.model, self.col_data, self.geom, self.geom_data, self.configuration.q)
+            now = time.monotonic()
+            dt = 0.0 if self._diag_prev_t is None else now - self._diag_prev_t
+            self._diag_prev_t = now
+            dists = [self.geom_data.distanceResults[k].min_distance for k in range(n)]
+            if 0.0 < dt < 0.2:
+                for k in range(n):
+                    if dists[k] < DIAG_NEAR:
+                        cp = self.geom.collisionPairs[k]
+                        nm = self.geom.geometryObjects[cp.first].name + "<->" + self.geom.geometryObjects[cp.second].name
+                        self._diag_near[nm] = self._diag_near.get(nm, 0.0) + dt
+            k = int(np.argmin(dists))
+            cp = self.geom.collisionPairs[k]
+            a = self.geom.geometryObjects[cp.first].name
+            b = self.geom.geometryObjects[cp.second].name
+            self.log.info(f"min-gap {dists[k]:+.4f} m  {a} <-> {b}", throttle_duration_sec=0.3)
+            if now - self._diag_last_dump >= DIAG_DUMP_PERIOD:
+                span_min = (now - self._diag_t0) / 60.0
+                d_ret = self._diag_retreats - self._diag_retreats_last
+                self._diag_retreats_last = self._diag_retreats
+                top = sorted(self._diag_near.items(), key=lambda kv: -kv[1])[:5]
+                tops = "; ".join(f"{nm} {t:.1f}s" for nm, t in top) or "none"
+                self.log.info(f"DIAG near<{DIAG_NEAR}: {tops} | retreats +{d_ret}/{DIAG_DUMP_PERIOD:.0f}s (cum {self._diag_retreats}, {self._diag_retreats/max(span_min,1e-6):.1f}/min over {span_min:.1f}min)")
+                self._diag_last_dump = now
+        except Exception as e:
+            if self.log is not None:
+                self.log.warn(f"diag _log_min_gap failed: {e}", throttle_duration_sec=5.0)
+
+    def _near_collision(self):
+        """True if the smallest collision-pair gap is below D_INFLUENCE (indicator for logs/haptics)."""
+        cd = getattr(self.configuration, "collision_data", None)
+        if cd is None or self.geom is None:
+            return False
+        try:
+            npairs = len(self.geom.collisionPairs)
+            dmin = min((cd.distanceResults[k].min_distance for k in range(npairs)), default=1e9)
+            return dmin < D_INFLUENCE
+        except Exception:
+            return False
 
 class Bridge(Node):
     """ROS2 node: HTC Vive controller -> Pink diff-IK -> SO-100 arm and gripper."""
@@ -283,8 +582,7 @@ class Bridge(Node):
         """Build IK, compute shoulder origin and reach-shell radii,
         set up publishers/subscribers/timers and shared teleop state."""
         super().__init__("vive_so100_pink_bridge")
-        self.ik = PinkIK(URDF, EE_FRAME, ARM, srdf_path=srdf_path(), package_dirs=mesh_pkg_dirs(),
-                         collision_mode=COLLISION_MODE, logger=self.get_logger())
+        self.ik = PinkIK(URDF, EE_FRAME, ARM, srdf_path=srdf_path(), package_dirs=mesh_pkg_dirs(), collision_mode=COLLISION_MODE, logger=self.get_logger())
         self.model = self.ik.model
         self.shoulder = self.shoulder_origin()
         mn,mx = self.reach_shell()
@@ -323,6 +621,12 @@ class Bridge(Node):
         self._R_des_prev = None
         self._blend_from = None
         self._blend_n = 0
+        self._steptimes = []
+        self._steptime_last = time.monotonic()
+        self._lead_ratios = []
+        self._ang_lead_ratios = []
+        self._ee_speeds = []
+        self._prev_ee = None
         self._pos_filter = OneEuroFilter(FILTER_MIN_CUTOFF, FILTER_BETA)
         self.create_subscription(Float64MultiArray, "/vive/pose", self.on_vive_pose, 10)
         self.create_subscription(Float64MultiArray, "/vive/buttons", self.on_vive_buttons, 10)
@@ -485,6 +789,9 @@ class Bridge(Node):
                 else:
                     self.shared["engaged"] = False
                     self.get_logger().info("FROZEN")
+            else:
+                age = now - self._pose_t
+                self.get_logger().warn(f"PAD ignored: ready={self.shared['ready']} fresh={fresh} pose_age={age:.2f}s")
         self._pad_was = pad
 
         if menu and not self._menu_was:
@@ -565,18 +872,46 @@ class Bridge(Node):
         else:
             R_des = self.ik.fk_rotation()
         R_des = self._ori_step(R_des)
+        R_ee = self.ik.fk_rotation()
+        w_lead = pin.log3(R_des @ R_ee.T)
+        a_lead = float(np.linalg.norm(w_lead))
+        self._ang_lead_ratios.append(a_lead / MAX_ANG_LEAD)
+        if a_lead > MAX_ANG_LEAD and a_lead > 1e-9:
+            R_des = pin.exp3(w_lead * (MAX_ANG_LEAD / a_lead)) @ R_ee
+            self._R_des_prev = R_des
 
+        _ee = self.ik.fk_translation()
+        self._lead_ratios.append(float(np.linalg.norm(tgt - _ee)) / MAX_LEAD)
+        if self._prev_ee is not None:
+            self._ee_speeds.append(float(np.linalg.norm(_ee - self._prev_ee)) / DT)
+        self._prev_ee = _ee
+
+        _t_step0 = time.perf_counter()
         q_arm = self.ik.step(tgt, R_des, DT)
-
-        if self.ik.blocked and engaged and COLLISION_MODE == "reanchor":
-            self.shared["target"] = self.ik.fk_translation()
-            self._capture_refs()
+        self._steptimes.append((time.perf_counter() - _t_step0) * 1000.0)
+        _t_now = time.monotonic()
+        if self._steptimes and _t_now - self._steptime_last >= 10.0:
+            _a = np.array(self._steptimes)
+            self.get_logger().info(f"STEPTIME n={len(_a)} p50={np.percentile(_a,50):.2f} " f"p95={np.percentile(_a,95):.2f} max={_a.max():.2f} ms")
+            if self._lead_ratios:
+                _lr = np.array(self._lead_ratios)
+                self.get_logger().info(f"LEAD n={len(_lr)} p50={np.percentile(_lr,50):.2f} " f"p95={np.percentile(_lr,95):.2f} sat>0.95={float(np.mean(_lr > 0.95)):.2f}")
+            if self._ang_lead_ratios:
+                _ar = np.array(self._ang_lead_ratios)
+                self.get_logger().info(f"ANGLEAD n={len(_ar)} p50={np.percentile(_ar,50):.2f} " f"p95={np.percentile(_ar,95):.2f} sat>0.95={float(np.mean(_ar > 0.95)):.2f}")
+            if self._ee_speeds:
+                _es = np.array(self._ee_speeds) * 100.0
+                self.get_logger().info(f"EESPEED n={len(_es)} p50={np.percentile(_es,50):.2f} " f"p95={np.percentile(_es,95):.2f} cm/s")
+            self._steptimes = []
+            self._lead_ratios = []
+            self._ang_lead_ratios = []
+            self._ee_speeds = []
+            self._steptime_last = _t_now
 
         if self._blend_n > 0 and self._blend_from is not None:
             a = 1.0 - (self._blend_n - 1)/ float(BLEND_TICKS)
             q_arm = (1.0 - a) * self._blend_from + a * q_arm
             self._blend_n -= 1
-
         if (time.monotonic() - self._js_t) < JOINT_TIMEOUT:
             self.send_arm(q_arm)
         else:
