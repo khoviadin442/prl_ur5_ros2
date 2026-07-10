@@ -1,0 +1,105 @@
+---
+# Mantis (dual UR5) VR teleop config — left arm.
+#
+# Runs BOTH inside the docker container and on the host: urdf/srdf below are
+# RELATIVE to this config file's directory (the shared dir is /home/ros/share in
+# the container and ~/work/docker_shared on the host), and the URDF references
+# meshes via package:// (resolved through AMENT_PREFIX_PATH: /opt/ros + mantis_ws
+# in the container; ~/work/mantis_host_deps/fakeprefix on the host).
+#
+# In-container start (robot/sim stack in another terminal):
+#   source /opt/ros/jazzy/setup.bash && source /home/ros/share/mantis_ws/install/setup.bash
+#   python3 /home/ros/share/teleop_mantis.py
+# vive_pub always runs ON THE HOST (SteamVR): ~/work/docker_shared/run_vive_pub.sh
+#
+# Regenerate the URDF after robot-configuration changes (host):
+#   cd ~/work/SO-100-HTC-vive-teleop && source install/setup.bash
+#   export AMENT_PREFIX_PATH=~/work/mantis_host_deps/fakeprefix:$AMENT_PREFIX_PATH
+#   python -c "import xml.parsers.expat, xacro; open('/tmp/m.urdf','w').write(xacro.process_file('/home/zxckiryuha/work/docker_shared/mantis_ws/src/prl_ur5_ros2/prl_ur5_description/urdf/mantis.urdf.xacro', mappings={'gz_sim':'true'}).toprettyxml(indent='  '))"
+#   sed -e "s|file:///home/zxckiryuha/work/mantis_host_deps/fakeprefix/share/ur_description|package://ur_description|g" -e "s|file:///home/zxckiryuha/work/mantis_host_deps/fakeprefix/share/prl_ur5_description|package://prl_ur5_description|g" /tmp/m.urdf > /home/zxckiryuha/work/docker_shared/mantis_ws/mantis.urdf
+#
+# NOTE: barrier keys (collision_barrier, d_min, ...) live under ik:, NOT teleop:
+# — values left under teleop: are ignored (a warning is printed at start).
+urdf: mantis_ws/mantis.urdf
+srdf: mantis_ws/src/prl_ur5_ros2/prl_ur5_moveit/config/mantis.srdf
+ee_frame: left_tool0
+shoulder_joint: left_shoulder_lift_joint
+arm: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint,
+      left_wrist_1_joint, left_wrist_2_joint, left_wrist_3_joint]
+# forward_position_controller drives BOTH arms; joints we don't teleoperate are
+# filled from their measured positions on every publish.
+arm_cmd_joints: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_joint,
+                 left_wrist_1_joint, left_wrist_2_joint, left_wrist_3_joint,
+                 right_shoulder_pan_joint, right_shoulder_lift_joint, right_elbow_joint,
+                 right_wrist_1_joint, right_wrist_2_joint, right_wrist_3_joint]
+# Parked pose of everything NOT in `arm` (right arm), rad. At startup the bridge
+# compares this with the MEASURED /joint_states and automatically rebuilds the
+# collision model at the real parked pose if any joint differs by >0.1 rad, so
+# left-vs-right avoidance always matches reality. Values here are only the
+# fallback for joints that never appear in /joint_states.
+locked_q: {}
+rate: 100.0
+
+ik:
+  position_cost: 1.0
+  orientation_cost: 0.5       # 6-DOF arm: orientation fully controllable; position still dominates
+  lm_damping: 0.01            # Levenberg-Marquardt damping: tames velocities near singularities
+  task_gain: 0.9              # per-tick error gain; higher = less tracking lag (keep <= 1.0)
+  posture_cost: 0.02          # regularizes elbow configuration / null space
+  vel_scale: 0.3
+  collision_margin: 0.01
+  # Collision handling: gap >= d_min enforced as a hard QP inequality -> the arm
+  # dodges (itself, the other arm, table, walls, camera fixtures) instead of freezing.
+  collision_barrier: true
+  d_min: 0.015                # m, hard minimum link-pair gap (keep > collision_margin)
+  d_influence: 0.04           # m, "near collision" indicator threshold (logs)
+  barrier_gain: 100.0
+  barrier_safe_gain: 0.0      # keep 0: pink's safe-displacement pull acts everywhere and drags the arm
+  self_collision_min_hops: 2  # drop arm-arm pairs closer than this in the kinematic tree
+  n_collision_pairs: 32       # barrier handles the 32 closest pairs (0 = all); python jacobian is linear in this
+  prune_samples: 20000        # reachability prune sampling (0 = disable)
+  prune_margin: 0.05          # m, drop arm-vs-static pairs never closer than this
+  drop_dist_thresh: 0.03      # m, drop non-env static pairs already nearer than this at reference pose
+  env_keywords: [table, wall, floor, ground, camera]   # never drop pairs with these (by name)
+
+teleop:
+  scale: 0.5                  # controller-to-robot position scale (your working value)
+  az_gain: 1.0                # azimuth gain around the shoulder (your working value)
+  reach_lo_frac: 0.05         # near-max shell: the barrier protects the near-base region
+  reach_hi_frac: 0.99
+  axis_sign: [-1.0, -1.0, 1.0]  # your working mapping
+  axis_map: [2, 0, 1]           # your working mapping
+  ori_sign: [-1.0, -1.0, 1.0]     # your working mapping
+  # --- latency / smoothing ---
+  filter_min_cutoff: 1.5      # one-euro: jitter smoothing at rest (Hz)
+  filter_beta: 15.0           # one-euro: cutoff growth with speed, Hz per m/s -> ~5-10ms lag in motion
+  max_target_speed: 2.0       # m/s cap on target motion (scale 1.2 needs headroom)
+  max_lead: 0.08              # m, max target distance ahead of the (commanded) EE
+  max_ang_speed: 4.0          # rad/s slew of desired orientation
+  max_ang_lead: 0.5           # rad, max desired-vs-actual EE orientation lead
+  ori_alpha: 0.8              # orientation smoothing (1.0 = off)
+  max_joint_lead: 0.15        # rad, max |cmd - measured| per joint (anti-runaway; also the max snap after an external block/pause)
+  # --- robustness ---
+  pose_timeout: 0.2           # s, /vive/pose considered stale -> freeze + re-anchor on recovery
+  joint_timeout: 0.3          # s, joint_states considered stale -> hold IK + resync on recovery
+  buttons_timeout: 0.5        # s, /vive/buttons considered stale -> gripper latches last state
+  pad_debounce: 0.25          # s, min time between trackpad engage/freeze toggles
+  disengage_blend_ticks: 5    # ticks to blend the command after a freeze (no step)
+  vr_rate: 250.0              # Hz, target-shaping tick
+
+gripper:
+  # NOTE: standard_setup.yaml currently has gripper_controller: 'none' for the left
+  # arm — the trigger will log "gripper action server not ready" until one is enabled.
+  grip_open: 0.0              # your working values (position grows toward closed)
+  grip_close: 1.1
+  trig_hold: 0.15
+  effort: 5.0
+  action: /left_gripper_controller/gripper_cmd
+
+topics:
+  arm_cmd: /forward_position_controller/commands
+  joint_states: /joint_states
+  vive_pose: /vive/pose
+  vive_buttons: /vive/buttons
+
+rlimits: {}
