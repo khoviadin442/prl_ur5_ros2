@@ -1,6 +1,7 @@
 import os
 import yaml
 import time
+import threading
 import numpy as np
 import pinocchio as pin
 import qpsolvers
@@ -25,7 +26,7 @@ with open(path) as f:
 # Barrier keys moved from teleop: to ik: — warn if an old-style config still has them
 # under teleop (their values are ignored there; do NOT fall back, the old defaults
 # include the known-bad barrier_safe_gain=1.0).
-for _k in ("collision_barrier", "d_min", "d_influence", "barrier_gain", "barrier_safe_gain",
+for _k in ("collision_barrier", "d_min", "d_min_self", "d_influence", "barrier_gain", "barrier_safe_gain",
            "self_collision_min_hops", "drop_dist_thresh", "n_collision_pairs"):
     if _k in (CFG.get("teleop") or {}):
         print(f"WARNING: teleop.{_k} has moved to ik.{_k}; the value under teleop is IGNORED "
@@ -64,8 +65,18 @@ COLLISION_BARRIER = bool(CFG["ik"].get("collision_barrier", True))
 # d_min must stay ABOVE collision_margin: in_collision() honors the margin, so a
 # barrier floor below it would count barrier-held poses as collisions.
 D_MIN = float(CFG["ik"].get("d_min", 0.015))
+# Separate (smaller) floor for arm SELF pairs. Structurally-close self pairs
+# (e.g. forearm<->wrist_2 on a UR: convex-hull gap sits on a ~15mm plateau over
+# almost the whole wrist range) would otherwise ride the d_min boundary
+# permanently — stealing wrist DOF and chattering. Hull inflation makes the
+# small floor still conservative vs real contact.
+D_MIN_SELF = float(CFG["ik"].get("d_min_self", 0.006))
 D_INFLUENCE = float(CFG["ik"].get("d_influence", 0.04))
-BARRIER_GAIN = float(CFG["ik"].get("barrier_gain", 100.0))
+# NOTE: keep barrier_gain*dt well below 1.0. gain=100 at 100 Hz gives
+# gamma*dt=1.0 — a discrete CBF with zero stability margin: on an active
+# constraint the QP bangs joints into the velocity limits at the Nyquist
+# frequency (the "violent shaking" diagnosed from the 2026-07-10 bag).
+BARRIER_GAIN = float(CFG["ik"].get("barrier_gain", 15.0))
 # NOTE: keep barrier_safe_gain at 0.0 — pink adds its "safe displacement" pull to the
 # QP objective unconditionally (not just near contact), which drags the whole arm,
 # leaves a multi-cm steady position error and makes tracking sluggish. The hard CBF
@@ -96,6 +107,10 @@ for i in range(3):
 # invert the sense of rotation about that axis without touching position mapping.
 ORI_SIGN = np.array(CFG["teleop"].get("ori_sign", [1.0, 1.0, 1.0]), float)
 
+# Nose within this angle of vertical at engage -> heading falls back to the
+# controller top axis (see yaw_frame); stored as the sine = horizontal-projection norm.
+YAW_FALLBACK_SIN = np.sin(np.radians(float(CFG["teleop"].get("yaw_fallback_deg", 15.0))))
+
 # Target shaping / latency:
 MAX_TARGET_SPEED = float(CFG["teleop"].get("max_target_speed", 1.2))
 MAX_LEAD = float(CFG["teleop"].get("max_lead", 0.08))
@@ -118,6 +133,17 @@ VR_RATE = float(CFG["teleop"].get("vr_rate", 250.0))
 VR_DT = 1.0 / VR_RATE
 MAX_TARGET_STEP = MAX_TARGET_SPEED * VR_DT
 MAX_ANG_STEP = MAX_ANG_SPEED * DT
+
+# Output command shaping: a dedicated thread republishes the IK result at
+# out_rate with per-joint velocity+acceleration limits, so the robot always sees
+# a dense stream with continuous velocity — no 100 Hz staircase beating against
+# the UR servo cycle (125 Hz on CB3), and any residual tick-level oscillation of
+# the IK output is attenuated below perception. out_rate 0 = old direct path.
+OUT_RATE = float(CFG["teleop"].get("out_rate", 250.0))
+OUT_VEL = float(CFG["teleop"].get("out_vel", 1.5))
+OUT_ACCEL = float(CFG["teleop"].get("out_accel", 10.0))
+OUT_KP = float(CFG["teleop"].get("out_kp", 20.0))
+OUT_STALE = max(3.0 * DT, 0.05)
 
 GRIP_OPEN = float(CFG["gripper"]["grip_open"])
 GRIP_CLOSE = float(CFG["gripper"]["grip_close"])
@@ -177,6 +203,150 @@ class OneEuroFilter:
         self.dx_prev = dx_hat
         return x_hat
 
+class CommandShaper:
+    """Robot-facing command stage: tracks the latest IK joint vector with
+    per-joint velocity and acceleration limits, publishing at out_rate from its
+    own thread. Feed-forward only (no measured feedback): the braking-aware
+    profile cannot overshoot the target. While the target is stale (IK held /
+    not ready) it publishes nothing and hard-resyncs to the next fresh target,
+    which the tick has already re-anchored to the measured robot."""
+    def __init__(self, publisher, rate, v_max, a_max, kp):
+        self.pub = publisher
+        self.rate = float(rate)
+        self.v_max = float(v_max)
+        self.a_max = float(a_max)
+        self.kp = float(kp)
+        self._lock = threading.Lock()
+        self._target = None
+        self._t_target = 0.0
+        self._q = None
+        self._v = None
+        self._dts = []
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        self._thread.join(timeout=1.0)
+
+    def set_target(self, vec):
+        vec = np.asarray(vec, float)
+        with self._lock:
+            self._target = vec
+            self._t_target = time.monotonic()
+
+    def stats(self):
+        """(n, p50, p95, max) of actual publish intervals [ms] since last call."""
+        with self._lock:
+            arr, self._dts = self._dts, []
+        if not arr:
+            return None
+        a = np.array(arr)
+        return len(a), float(np.percentile(a, 50)), float(np.percentile(a, 95)), float(a.max())
+
+    def _step(self, tgt, dt):
+        if self._q is None or self._q.shape != tgt.shape:
+            self._q = tgt.copy()
+            self._v = np.zeros_like(tgt)
+            return self._q
+        err = tgt - self._q
+        v_brake = np.sqrt(2.0 * self.a_max * np.abs(err))
+        v_des = np.clip(np.clip(self.kp * err, -v_brake, v_brake), -self.v_max, self.v_max)
+        self._v = self._v + np.clip(v_des - self._v, -self.a_max * dt, self.a_max * dt)
+        self._q = self._q + self._v * dt
+        return self._q
+
+    def _run(self):
+        period = 1.0 / self.rate
+        next_t = time.monotonic()
+        t_last = next_t
+        while not self._stop:
+            next_t += period
+            delay = next_t - time.monotonic()
+            if delay > 0.0:
+                time.sleep(delay)
+            else:
+                next_t = time.monotonic()  # fell behind (GIL/load): re-anchor, don't burst
+            now = time.monotonic()
+            # measured dt (clamped) so velocity stays continuous through scheduling jitter
+            dt = min(max(now - t_last, 0.25 * period), 4.0 * period)
+            t_last = now
+            with self._lock:
+                tgt = self._target
+                fresh = tgt is not None and (now - self._t_target) < OUT_STALE
+            if tgt is None:
+                continue
+            if not fresh:
+                self._q = None  # resync to the next fresh target (tick re-anchors it to measured)
+                continue
+            q = self._step(tgt, dt)
+            with self._lock:
+                self._dts.append(dt * 1000.0)
+            msg = Float64MultiArray()
+            msg.data = [float(x) for x in q]
+            self.pub.publish(msg)
+
+
+try:
+    from pink.barriers import SelfCollisionBarrier as _SCBarrier
+except Exception:
+    _SCBarrier = None
+
+if _SCBarrier is not None:
+    class MarginSelfCollisionBarrier(_SCBarrier):
+        """SelfCollisionBarrier with a per-pair floor: h_i = d_i - d_min_i
+        (self pairs get D_MIN_SELF, everything else D_MIN). Rows of h and J are
+        both selected by MARGIN — the parent selects J rows by raw distance,
+        which would mismatch h rows under per-pair floors."""
+        def __init__(self, n, gain, safe_displacement_gain, d_min_vec):
+            d_min_vec = np.asarray(d_min_vec, float)
+            super().__init__(n, gain=gain, safe_displacement_gain=safe_displacement_gain, d_min=float(d_min_vec.min()))
+            self.d_min_vec = d_min_vec
+
+        def _margins(self, configuration):
+            n_pairs = len(configuration.collision_model.collisionPairs)
+            d = np.array([configuration.collision_data.distanceResults[k].min_distance for k in range(n_pairs)])
+            return d - self.d_min_vec[:n_pairs]
+
+        def _select(self, margins):
+            if self.dim >= len(margins):
+                return np.arange(len(margins))
+            return np.argpartition(-margins, -self.dim)[-self.dim:]
+
+        def compute_barrier(self, configuration):
+            m = self._margins(configuration)
+            return m[self._select(m)]
+
+        def compute_jacobian(self, configuration):
+            model, data = configuration.model, configuration.data
+            cm, cd = configuration.collision_model, configuration.collision_data
+            m = self._margins(configuration)
+            idxs = self._select(m)
+            J = np.zeros((self.dim, model.nv))
+            for i, k in enumerate(idxs):
+                k = int(k)
+                cp = cm.collisionPairs[k]
+                dr = cd.distanceResults[k]
+                j1_id = cm.geometryObjects[cp.first].parentJoint
+                j2_id = cm.geometryObjects[cp.second].parentJoint
+                w1 = np.array(dr.getNearestPoint1())
+                w2 = np.array(dr.getNearestPoint2())
+                r1 = w1 - data.oMi[j1_id].translation
+                r2 = w2 - data.oMi[j2_id].translation
+                if np.allclose(w1, w2):
+                    continue
+                n = (w1 - w2) / np.linalg.norm(w1 - w2)
+                J1 = pin.getJointJacobian(model, data, j1_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+                row = n.T @ J1[:3, :] + (pin.skew(r1) @ n).T @ J1[3:, :]
+                J2 = pin.getJointJacobian(model, data, j2_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+                row -= n.T @ J2[:3, :] + (pin.skew(r2) @ n).T @ J2[3:, :]
+                J[i] = row
+            return np.nan_to_num(J)
+
+
 class PinkIK:
     """Pinocchio model + Pink differential IK for the mantis left arm with
     self-collision / environment collision avoidance (dual-arm model, everything
@@ -234,14 +404,21 @@ class PinkIK:
         self.ee_task = FrameTask(ee_frame, position_cost=position_cost, orientation_cost=orientation_cost, lm_damping=lm_damping, gain=gain)
         self.posture = PostureTask(cost=posture_cost)
         self.barrier = None
+        self.pair_dmin = None
         if COLLISION_BARRIER and self.geom is not None:
             n_avail = len(self.geom.collisionPairs)
             if n_avail > 0:
                 try:
-                    from pink.barriers import SelfCollisionBarrier
+                    if _SCBarrier is None:
+                        raise ImportError("pink.barriers not importable")
+                    arm_jids = {self.model.getJointId(j) for j in self.arm_joints if self.model.existJointName(j)}
+                    on_arm = lambda gi: self.geom.geometryObjects[gi].parentJoint in arm_jids
+                    self.pair_dmin = np.array([D_MIN_SELF if (on_arm(cp.first) and on_arm(cp.second)) else D_MIN
+                                               for cp in self.geom.collisionPairs])
                     n_bar = n_avail if N_COLLISION_PAIRS <= 0 else min(N_COLLISION_PAIRS, n_avail)
-                    self.barrier = SelfCollisionBarrier(n_bar, gain=BARRIER_GAIN, safe_displacement_gain=BARRIER_SAFE_GAIN, d_min=D_MIN)
-                    self._info(f"SelfCollisionBarrier dim={n_bar} of {n_avail} pairs (d_min={D_MIN})")
+                    self.barrier = MarginSelfCollisionBarrier(n_bar, gain=BARRIER_GAIN, safe_displacement_gain=BARRIER_SAFE_GAIN, d_min_vec=self.pair_dmin)
+                    n_self = int(np.sum(self.pair_dmin == D_MIN_SELF))
+                    self._info(f"MarginSelfCollisionBarrier dim={n_bar} of {n_avail} pairs (d_min={D_MIN}, d_min_self={D_MIN_SELF} on {n_self} self pairs, gain={BARRIER_GAIN})")
                 except Exception as exc:
                     self._warn(f"pink.barriers unavailable ({exc}) -> falling back to collision reject")
             else:
@@ -533,22 +710,36 @@ class PinkIK:
         q = np.clip(q, self.model.lowerPositionLimit, self.model.upperPositionLimit)
         self.configuration.update(q)
 
+    def _floors(self):
+        """Per-pair floor vector (d_min_self for self pairs, d_min for the rest)."""
+        n = len(self.geom.collisionPairs)
+        if self.pair_dmin is not None and len(self.pair_dmin) >= n:
+            return self.pair_dmin[:n]
+        return np.full(n, D_MIN)
+
     def min_gap(self):
-        """(distance, pair-name) of the closest collision pair for the current configuration."""
+        """(distance, margin, pair-name) of the LOWEST-MARGIN collision pair
+        (margin = distance - that pair's floor) for the current configuration."""
         if self.geom is None or len(self.geom.collisionPairs) == 0:
-            return float("inf"), ""
+            return float("inf"), float("inf"), ""
         cd = getattr(self.configuration, "collision_data", None)
         if cd is None:
             pin.computeDistances(self.model, self.col_data, self.geom, self.geom_data, self.configuration.q)
             cd = self.geom_data
-        dists = [cd.distanceResults[k].min_distance for k in range(len(self.geom.collisionPairs))]
-        k = int(np.argmin(dists))
+        dists = np.array([cd.distanceResults[k].min_distance for k in range(len(self.geom.collisionPairs))])
+        margins = dists - self._floors()
+        k = int(np.argmin(margins))
         cp = self.geom.collisionPairs[k]
-        return float(dists[k]), self.geom.geometryObjects[cp.first].name + "<->" + self.geom.geometryObjects[cp.second].name
+        name = self.geom.geometryObjects[cp.first].name + "<->" + self.geom.geometryObjects[cp.second].name
+        return float(dists[k]), float(margins[k]), name
 
-    def _min_gap_at(self, q):
+    def _min_margin_at(self, q):
         pin.computeDistances(self.model, self.col_data, self.geom, self.geom_data, np.asarray(q, float))
-        return min((self.geom_data.distanceResults[k].min_distance for k in range(len(self.geom.collisionPairs))), default=1e9)
+        n = len(self.geom.collisionPairs)
+        if n == 0:
+            return 1e9
+        dists = np.array([self.geom_data.distanceResults[k].min_distance for k in range(n)])
+        return float(np.min(dists - self._floors()))
 
     def step(self, target_pos, target_R, dt=DT):
         """One diff-IK step toward (target_pos, target_R). With the barrier the collision
@@ -598,7 +789,9 @@ class PinkIK:
             q_new = self._retreat(q_prec, dt)
         if not np.array_equal(q_new, self.configuration.q):
             self.configuration.update(q_new)
-        self.blocked = self.min_gap()[0] < D_INFLUENCE
+        # "near collision" = within (d_influence - d_min) of the pair's own floor,
+        # so self pairs with a small floor don't flag it permanently
+        self.blocked = self.min_gap()[1] < (D_INFLUENCE - D_MIN)
         return self.arm_positions()
 
     def _retreat(self, q_prec, dt):
@@ -616,25 +809,25 @@ class PinkIK:
                 self._warn("retreat gradient ~0 -> holding", throttle=1.0)
                 return q_prec
             g = g / gn
-            g0 = self._min_gap_at(q_prec)
+            g0 = self._min_margin_at(q_prec)
             q_probe = np.clip(pin.integrate(self.model, q_prec, g * 1e-3), lo, hi)
-            if self._min_gap_at(q_probe) < g0:
+            if self._min_margin_at(q_probe) < g0:
                 g = -g
             k_ret = 0.1 * float(np.max(self.model.velocityLimit))
             v_ret = np.clip(k_ret * g, -self.model.velocityLimit, self.model.velocityLimit)
             q_ret = np.clip(pin.integrate(self.model, q_prec, v_ret * dt), lo, hi)
             if not np.isfinite(q_ret).all():
-                self._min_gap_at(q_prec)
+                self._min_margin_at(q_prec)
                 self._warn("retreat produced non-finite q -> holding", throttle=1.0)
                 return q_prec
-            if self._min_gap_at(q_ret) < g0:
-                self._min_gap_at(q_prec)
+            if self._min_margin_at(q_ret) < g0:
+                self._min_margin_at(q_prec)
                 self._warn("retreat worsened gap -> holding", throttle=1.0)
                 return q_prec
             return q_ret
         except Exception as exc:
             try:
-                self._min_gap_at(q_prec)
+                self._min_margin_at(q_prec)
             except Exception:
                 pass
             self._warn(f"retreat failed ({exc}) -> holding", throttle=1.0)
@@ -655,6 +848,11 @@ class Bridge(Node):
         self.get_logger().info(f"reach shell: r_min={self.r_min:.3f} r_max={self.r_max:.3f} (raw {mn:.3f}..{mx:.3f})")
         self.phase = "wait"
         self.pub = self.create_publisher(Float64MultiArray, ARM_CMD_TOPIC, 10)
+        self.shaper = None
+        if OUT_RATE > 0:
+            self.shaper = CommandShaper(self.pub, OUT_RATE, OUT_VEL, OUT_ACCEL, OUT_KP)
+            self.shaper.start()
+            self.get_logger().info(f"CommandShaper: {OUT_RATE:.0f} Hz, v_max={OUT_VEL}, a_max={OUT_ACCEL}, kp={OUT_KP}")
         # best-effort keep-last on streams: never build a stale backlog. vive topics have
         # a single publisher -> depth 1 (latest only). /joint_states is SHARED by several
         # broadcasters (arms + hand) -> depth 5, or a burst from one publisher displaces
@@ -764,10 +962,19 @@ class Bridge(Node):
 
     def yaw_frame(self, Rc):
         """Heading-only frame from the controller orientation: horizontal forward/right + true up.
-        Makes the position mapping robust to how the controller is pitched/rolled at engage."""
+        Makes the position mapping robust to how the controller is pitched/rolled at engage.
+        A near-vertical nose carries no usable heading, so within yaw_fallback_deg of
+        vertical the heading comes from the controller TOP axis instead (near-horizontal
+        exactly then); its sign follows the nose so that "away from the user" stays
+        forward: nose down -> top points away, nose up -> top points back."""
+        Rc = np.asarray(Rc)
         up = np.array([0.0, 1.0, 0.0])
-        nose = -np.asarray(Rc)[:, 2]
-        back_h = (nose @ up) * up - nose
+        nose = -Rc[:, 2]
+        fwd = nose
+        if np.linalg.norm(fwd - (fwd @ up) * up) < YAW_FALLBACK_SIN:
+            fwd = -np.sign(nose @ up) * Rc[:, 1]
+            self.get_logger().warn("yaw_frame: nose near-vertical -> heading taken from controller top axis")
+        back_h = (fwd @ up) * up - fwd
         n = np.linalg.norm(back_h)
         if n < 1e-6:
             return np.eye(3)
@@ -896,20 +1103,31 @@ class Bridge(Node):
             self.get_logger().info(f"RECORD {'ON' if self.mark else 'OFF'}")
         self._menu_was = menu
 
-    def send_arm(self, positions):
-        """Publish arm joint positions to the arm controller, in ARM_CMD_JOINTS order,
-        filling joints we do not teleoperate from their measured positions."""
+    def full_cmd(self, positions):
+        """Full ARM_CMD_JOINTS vector: teleoperated joints from `positions`, the
+        rest filled from their measured positions. None while any joint is unknown."""
         cmd = dict(zip(ARM, positions))
         data = []
         for j in ARM_CMD_JOINTS:
             if j in cmd:
-                data.append(cmd[j])
+                data.append(float(cmd[j]))
             elif isinstance(self.pos, dict) and j in self.pos:
-                data.append(self.pos[j])
+                data.append(float(self.pos[j]))
             else:
-                return
+                return None
+        return data
+
+    def send_arm(self, positions):
+        """Hand the command to the output shaper (which publishes at OUT_RATE), or
+        publish directly when the shaper is disabled (out_rate: 0)."""
+        data = self.full_cmd(positions)
+        if data is None:
+            return
+        if self.shaper is not None:
+            self.shaper.set_target(data)
+            return
         msg = Float64MultiArray()
-        msg.data = [float(x) for x in data]
+        msg.data = data
         self.pub.publish(msg)
 
     def send_grip(self, pos):
@@ -1027,7 +1245,7 @@ class Bridge(Node):
                 # uniform scale keeps the command on the meas->cmd line (a per-joint box
                 # clamp mixes a corner configuration the barrier never certified)
                 self.ik.set_arm(meas + lead * (MAX_JOINT_LEAD / mlead))
-                if self.ik.geom is not None and self.ik.min_gap()[0] < D_MIN and self._last_cmd is not None:
+                if self.ik.geom is not None and self.ik.min_gap()[1] < 0 and self._last_cmd is not None:
                     self.ik.set_arm(self._last_cmd)  # scaled cmd violates the barrier floor -> hold last safe cmd
                 q_arm = self.ik.arm_positions()
                 self.get_logger().warn("cmd ran ahead of robot -> clamped to measured + max_joint_lead", throttle_duration_sec=1.0)
@@ -1039,8 +1257,8 @@ class Bridge(Node):
 
         self.dbg += 1
         if self.dbg % 50 == 0:
-            gap_d, gap_pair = self.ik.min_gap()
-            print("blocked=%s min-gap=%+.4f %s" % (self.ik.blocked, gap_d, gap_pair))
+            gap_d, gap_m, gap_pair = self.ik.min_gap()
+            print("blocked=%s min-gap=%+.4f margin=%+.4f %s" % (self.ik.blocked, gap_d, gap_m, gap_pair))
             for i, j in enumerate(ARM):
                 cmd = float(q_arm[i])
                 meas = self.pos.get(j) if isinstance(self.pos, dict) else None
@@ -1055,6 +1273,10 @@ class Bridge(Node):
             d_ret = self.ik.retreats - self._retreats_last
             self._retreats_last = self.ik.retreats
             self.get_logger().info(f"STEPTIME n={len(a)} p50={np.percentile(a,50):.2f} p95={np.percentile(a,95):.2f} max={a.max():.2f} ms | retreats +{d_ret}/10s")
+            if self.shaper is not None:
+                st = self.shaper.stats()
+                if st is not None:
+                    self.get_logger().info(f"OUTSTREAM n={st[0]} p50={st[1]:.2f} p95={st[2]:.2f} max={st[3]:.2f} ms")
             self._steptimes = []
             self._steptime_last = now_m
         if self.ik.blocked:
@@ -1089,6 +1311,8 @@ def main():
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
+        if getattr(node, "shaper", None) is not None:
+            node.shaper.stop()
         node.destroy_node()
         rclpy.ok() and rclpy.shutdown()
 

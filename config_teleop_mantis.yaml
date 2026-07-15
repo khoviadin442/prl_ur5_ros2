@@ -42,7 +42,7 @@ rate: 100.0
 
 ik:
   position_cost: 1.0
-  orientation_cost: 0.5       # 6-DOF arm: orientation fully controllable; position still dominates
+  orientation_cost: 0.6       # 6-DOF arm: orientation fully controllable; position still dominates
   lm_damping: 0.01            # Levenberg-Marquardt damping: tames velocities near singularities
   task_gain: 0.9              # per-tick error gain; higher = less tracking lag (keep <= 1.0)
   posture_cost: 0.02          # regularizes elbow configuration / null space
@@ -52,8 +52,15 @@ ik:
   # dodges (itself, the other arm, table, walls, camera fixtures) instead of freezing.
   collision_barrier: true
   d_min: 0.015                # m, hard minimum link-pair gap (keep > collision_margin)
-  d_influence: 0.04           # m, "near collision" indicator threshold (logs)
-  barrier_gain: 100.0
+  d_min_self: 0.006           # m, floor for arm SELF pairs. forearm<->wrist_2 hull gap has a ~15mm
+                              # plateau over almost the whole wrist range: with d_min=15mm that pair
+                              # was pinned on the floor 70-90% of the time (diag 2026-07-10) — stealing
+                              # wrist DOF (bad orientation tracking, reconfigurations) and chattering.
+                              # The real fold collision still gets blocked at 6mm of HULL gap.
+  d_influence: 0.04           # m, "near collision" indicator threshold above the pair's floor (logs)
+  barrier_gain: 15.0          # was 100.0: gain*dt=1.0 at 100 Hz = discrete CBF with zero stability
+                              # margin -> 50 Hz bang-bang on any active constraint (the violent shaking
+                              # in the 2026-07-10 bag, markers M1/M2). Keep gain*dt <= ~0.2.
   barrier_safe_gain: 0.0      # keep 0: pink's safe-displacement pull acts everywhere and drags the arm
   self_collision_min_hops: 2  # drop arm-arm pairs closer than this in the kinematic tree
   n_collision_pairs: 32       # barrier handles the 32 closest pairs (0 = all); python jacobian is linear in this
@@ -63,21 +70,22 @@ ik:
   env_keywords: [table, wall, floor, ground, camera]   # never drop pairs with these (by name)
 
 teleop:
-  scale: 0.5                  # controller-to-robot position scale (your working value)
+  scale: 1                # controller-to-robot position scale (your working value)
   az_gain: 1.0                # azimuth gain around the shoulder (your working value)
   reach_lo_frac: 0.05         # near-max shell: the barrier protects the near-base region
   reach_hi_frac: 0.99
   axis_sign: [-1.0, -1.0, 1.0]  # your working mapping
   axis_map: [2, 0, 1]           # your working mapping
   ori_sign: [-1.0, -1.0, 1.0]     # your working mapping
+  yaw_fallback_deg: 15.0      # nose within this angle of vertical at engage -> heading from the controller TOP axis
   # --- latency / smoothing ---
-  filter_min_cutoff: 1.5      # one-euro: jitter smoothing at rest (Hz)
-  filter_beta: 15.0           # one-euro: cutoff growth with speed, Hz per m/s -> ~5-10ms lag in motion
-  max_target_speed: 2.0       # m/s cap on target motion (scale 1.2 needs headroom)
+  filter_min_cutoff: 0.6      # one-euro: jitter smoothing at rest (Hz); was 1.5 — lowered vs hand-tremor buzz on the real arm
+  filter_beta: 5.0            # one-euro: cutoff growth with speed, Hz per m/s; was 15.0 — noise spikes were blowing the cutoff open
+  max_target_speed: 1.0       # m/s cap on target motion (scale 1.2 needs headroom)
   max_lead: 0.08              # m, max target distance ahead of the (commanded) EE
   max_ang_speed: 4.0          # rad/s slew of desired orientation
   max_ang_lead: 0.5           # rad, max desired-vs-actual EE orientation lead
-  ori_alpha: 0.8              # orientation smoothing (1.0 = off)
+  ori_alpha: 0.15             # orientation smoothing (1.0 = off); was 0.8 = ~10ms time constant at 100Hz, i.e. no smoothing — raw Vive orientation jitter buzzed the wrists
   max_joint_lead: 0.15        # rad, max |cmd - measured| per joint (anti-runaway; also the max snap after an external block/pause)
   # --- robustness ---
   pose_timeout: 0.2           # s, /vive/pose considered stale -> freeze + re-anchor on recovery
@@ -86,6 +94,14 @@ teleop:
   pad_debounce: 0.25          # s, min time between trackpad engage/freeze toggles
   disengage_blend_ticks: 5    # ticks to blend the command after a freeze (no step)
   vr_rate: 250.0              # Hz, target-shaping tick
+  # --- output command shaping (teleop-side smoothness; robot config untouched) ---
+  # A dedicated thread republishes the IK result at out_rate with velocity+accel
+  # limits: kills the 100 Hz staircase / 125 Hz (CB3) beat and attenuates any
+  # residual tick-level IK oscillation. OUTSTREAM log line = actual stream timing.
+  out_rate: 250.0             # Hz robot-facing stream (0 = old direct 100 Hz publish)
+  out_vel: 1.5                # rad/s per-joint cap of the shaped stream (safety net, above IK's own limit)
+  out_accel: 10.0             # rad/s^2 per-joint cap — the smoothness knob (lower = smoother, more lag)
+  out_kp: 20.0                # 1/s tracking stiffness (~1/out_kp s of extra lag at speed)
 
 gripper:
   # NOTE: standard_setup.yaml currently has gripper_controller: 'none' for the left
