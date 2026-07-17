@@ -3,20 +3,21 @@
 #
 # Runs BOTH inside the docker container and on the host: urdf/srdf below are
 # RELATIVE to this config file's directory (the shared dir is /home/ros/share in
-# the container and ~/work/docker_shared on the host), and the URDF references
+# the container and ~/rabota/docker_shared on the host), and the URDF references
 # meshes via package:// (resolved through AMENT_PREFIX_PATH: /opt/ros + mantis_ws
-# in the container; ~/work/mantis_host_deps/fakeprefix on the host).
+# in the container; ~/rabota/mantis_host_deps/fakeprefix on the host).
 #
 # In-container start (robot/sim stack in another terminal):
 #   source /opt/ros/jazzy/setup.bash && source /home/ros/share/mantis_ws/install/setup.bash
 #   python3 /home/ros/share/teleop_mantis.py
-# vive_pub always runs ON THE HOST (SteamVR): ~/work/docker_shared/run_vive_pub.sh
+# vive_pub always runs ON THE HOST (SteamVR): ~/rabota/docker_shared/run_vive_pub.sh
 #
 # Regenerate the URDF after robot-configuration changes (host):
-#   cd ~/work/SO-100-HTC-vive-teleop && source install/setup.bash
-#   export AMENT_PREFIX_PATH=~/work/mantis_host_deps/fakeprefix:$AMENT_PREFIX_PATH
-#   python -c "import xml.parsers.expat, xacro; open('/tmp/m.urdf','w').write(xacro.process_file('/home/zxckiryuha/work/docker_shared/mantis_ws/src/prl_ur5_ros2/prl_ur5_description/urdf/mantis.urdf.xacro', mappings={'gz_sim':'true'}).toprettyxml(indent='  '))"
-#   sed -e "s|file:///home/zxckiryuha/work/mantis_host_deps/fakeprefix/share/ur_description|package://ur_description|g" -e "s|file:///home/zxckiryuha/work/mantis_host_deps/fakeprefix/share/prl_ur5_description|package://prl_ur5_description|g" /tmp/m.urdf > /home/zxckiryuha/work/docker_shared/mantis_ws/mantis.urdf
+#   source ~/rabota/SO-100-HTC-vive-teleop/.pixi/envs/default/setup.bash   # (colcon install/setup.bash сломан после переезда)
+#   export AMENT_PREFIX_PATH=~/rabota/mantis_host_deps/fakeprefix:$AMENT_PREFIX_PATH
+#   # fakeprefix: wsg_50_simulation и prl_ur5_description — СИМЛИНКИ на src (2026-07-16), правки xacro подхватываются сами
+#   python -c "import xml.parsers.expat, xacro; open('/tmp/m.urdf','w').write(xacro.process_file('/home/zxckiryuha/rabota/docker_shared/mantis_ws/src/prl_ur5_ros2/prl_ur5_description/urdf/mantis.urdf.xacro', mappings={'gz_sim':'true'}).toprettyxml(indent='  '))"
+#   sed -e "s|file:///home/zxckiryuha/rabota/mantis_host_deps/fakeprefix/share/ur_description|package://ur_description|g" -e "s|file:///home/zxckiryuha/rabota/mantis_host_deps/fakeprefix/share/prl_ur5_description|package://prl_ur5_description|g" /tmp/m.urdf > /home/zxckiryuha/rabota/docker_shared/mantis_ws/mantis.urdf
 #
 # NOTE: barrier keys (collision_barrier, d_min, ...) live under ik:, NOT teleop:
 # — values left under teleop: are ignored (a warning is printed at start).
@@ -42,11 +43,13 @@ rate: 100.0
 
 ik:
   position_cost: 1.0
-  orientation_cost: 0.6       # 6-DOF arm: orientation fully controllable; position still dominates
+  orientation_cost: 0.9       # 6-DOF arm: orientation fully controllable; position still dominates
+                              # NOTE 2026-07-15: a vector [0.6,0.6,0.15] (lazy tool-axis roll) was tried
+                              # and REVERTED: tool down -> hand yaw IS tool roll; tracking felt broken.
   lm_damping: 0.01            # Levenberg-Marquardt damping: tames velocities near singularities
   task_gain: 0.9              # per-tick error gain; higher = less tracking lag (keep <= 1.0)
   posture_cost: 0.02          # regularizes elbow configuration / null space
-  vel_scale: 0.3
+  vel_scale: 0.1
   collision_margin: 0.01
   # Collision handling: gap >= d_min enforced as a hard QP inequality -> the arm
   # dodges (itself, the other arm, table, walls, camera fixtures) instead of freezing.
@@ -79,7 +82,7 @@ teleop:
   ori_sign: [-1.0, -1.0, 1.0]     # your working mapping
   yaw_fallback_deg: 15.0      # nose within this angle of vertical at engage -> heading from the controller TOP axis
   # --- latency / smoothing ---
-  filter_min_cutoff: 0.6      # one-euro: jitter smoothing at rest (Hz); was 1.5 — lowered vs hand-tremor buzz on the real arm
+  filter_min_cutoff: 0.4      # one-euro: jitter smoothing at rest (Hz); was 1.5 — lowered vs hand-tremor buzz on the real arm
   filter_beta: 5.0            # one-euro: cutoff growth with speed, Hz per m/s; was 15.0 — noise spikes were blowing the cutoff open
   max_target_speed: 1.0       # m/s cap on target motion (scale 1.2 needs headroom)
   max_lead: 0.08              # m, max target distance ahead of the (commanded) EE
@@ -104,12 +107,15 @@ teleop:
   out_kp: 20.0                # 1/s tracking stiffness (~1/out_kp s of extra lag at speed)
 
 gripper:
-  # NOTE: standard_setup.yaml currently has gripper_controller: 'none' for the left
-  # arm — the trigger will log "gripper action server not ready" until one is enabled.
-  grip_open: 0.0              # your working values (position grows toward closed)
-  grip_close: 1.1
+  # Left arm carries the Weiss WSG50 (standard_setup.yaml: gripper "weiss-wsg50",
+  # gripper_controller "weiss-gripper", enabled 2026-07-15). If the action server
+  # is missing at runtime, the trigger logs "gripper action server not ready".
+  # WSG50: position = opening WIDTH in meters (0.0 = closed, 0.11 = fully open) —
+  # polarity is INVERTED vs the OnRobot RG2 values (0.0 open / 1.1 closed, rad).
+  grip_open: 0.11
+  grip_close: 0.0
   trig_hold: 0.15
-  effort: 5.0
+  effort: 5.0                 # -> grasping force hint [N] (wsg50_setup.yaml default is 10)
   action: /left_gripper_controller/gripper_cmd
 
 topics:
