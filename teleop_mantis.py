@@ -1221,7 +1221,15 @@ class Bridge(Node):
         engaged = self.shared["engaged"]
 
         if engaged and self.Rc_ref is not None:
-            w = ORI_SIGN * pin.log3(M @ (Rc @ self.Rc_ref.T) @ M.T)
+            # Heading-normalize the orientation delta by the ENGAGE yaw frame (the
+            # same _R_ref the position path uses). The raw world-frame delta axis
+            # rotates with the controller's absolute heading, so the same wrist
+            # gesture pitched the gripper DOWN at one engage heading and UP at the
+            # opposite one (approach flip). NOTE: goes together with ori_sign
+            # [1,1,1] — the old [-1,-1,1] was the 180deg-about-vertical compensator
+            # for the raw VR-universe heading, which _R_ref now removes per-engage.
+            dR = self._R_ref.T @ (Rc @ self.Rc_ref.T) @ self._R_ref
+            w = ORI_SIGN * pin.log3(M @ dR @ M.T)
             R_des = pin.exp3(w) @ self.R_anchor
         else:
             R_des = self.ik.fk_rotation()
