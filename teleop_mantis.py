@@ -23,18 +23,12 @@ path = os.environ.get("teleop_config", os.path.join(os.path.dirname(os.path.absp
 with open(path) as f:
     CFG = yaml.safe_load(f)
 
-# Barrier keys moved from teleop: to ik: — warn if an old-style config still has them
-# under teleop (their values are ignored there; do NOT fall back, the old defaults
-# include the known-bad barrier_safe_gain=1.0).
 for _k in ("collision_barrier", "d_min", "d_min_self", "d_influence", "barrier_gain", "barrier_safe_gain",
            "self_collision_min_hops", "drop_dist_thresh", "n_collision_pairs"):
     if _k in (CFG.get("teleop") or {}):
         print(f"WARNING: teleop.{_k} has moved to ik.{_k}; the value under teleop is IGNORED "
               f"(effective: {CFG.get('ik', {}).get(_k, 'built-in default')})")
-
-# urdf/srdf may be given relative to the CONFIG FILE's directory, so the same
-# config works on the host (~/work/docker_shared) and inside the docker container
-# (/home/ros/share) where the shared directory is mounted at a different path.
+        
 _CFG_DIR = os.path.dirname(os.path.abspath(path))
 def _cfg_path(p):
     return p if os.path.isabs(p) else os.path.join(_CFG_DIR, p)
@@ -44,8 +38,6 @@ EE_FRAME = CFG["ee_frame"]
 ARM = list(CFG["arm"])
 ARM_CMD_JOINTS = list(CFG["arm_cmd_joints"])
 SHOULDER_JOINT = CFG.get("shoulder_joint", "left_shoulder_lift_joint")
-# Parked pose for every joint NOT in `arm` (right arm, hand, ...). The reduced model
-# locks them here, so self-collision checks see the real parked robot, not zeros.
 LOCKED_Q = dict(CFG.get("locked_q") or {})
 
 RATE = float(CFG["rate"])
@@ -59,36 +51,16 @@ POSTURE_COST = float(CFG["ik"]["posture_cost"])
 VEL_SCALE = float(CFG["ik"]["vel_scale"])
 COLLISION_MARGIN = float(CFG["ik"]["collision_margin"])
 
-# Collision barrier (CBF): keeps the min link-pair gap >= d_min as a hard QP
-# inequality, so the arm slides around obstacles instead of freezing.
 COLLISION_BARRIER = bool(CFG["ik"].get("collision_barrier", True))
-# d_min must stay ABOVE collision_margin: in_collision() honors the margin, so a
-# barrier floor below it would count barrier-held poses as collisions.
 D_MIN = float(CFG["ik"].get("d_min", 0.015))
-# Separate (smaller) floor for arm SELF pairs. Structurally-close self pairs
-# (e.g. forearm<->wrist_2 on a UR: convex-hull gap sits on a ~15mm plateau over
-# almost the whole wrist range) would otherwise ride the d_min boundary
-# permanently — stealing wrist DOF and chattering. Hull inflation makes the
-# small floor still conservative vs real contact.
 D_MIN_SELF = float(CFG["ik"].get("d_min_self", 0.006))
 D_INFLUENCE = float(CFG["ik"].get("d_influence", 0.04))
-# NOTE: keep barrier_gain*dt well below 1.0. gain=100 at 100 Hz gives
-# gamma*dt=1.0 — a discrete CBF with zero stability margin: on an active
-# constraint the QP bangs joints into the velocity limits at the Nyquist
-# frequency (the "violent shaking" diagnosed from the 2026-07-10 bag).
 BARRIER_GAIN = float(CFG["ik"].get("barrier_gain", 15.0))
-# NOTE: keep barrier_safe_gain at 0.0 — pink adds its "safe displacement" pull to the
-# QP objective unconditionally (not just near contact), which drags the whole arm,
-# leaves a multi-cm steady position error and makes tracking sluggish. The hard CBF
-# inequality alone does the dodging.
 BARRIER_SAFE_GAIN = float(CFG["ik"].get("barrier_safe_gain", 0.0))
 SELF_MIN_HOPS = int(CFG["ik"].get("self_collision_min_hops", 2))
 N_COLLISION_PAIRS = int(CFG["ik"].get("n_collision_pairs", 32))
 DROP_DIST_THRESH = float(CFG["ik"].get("drop_dist_thresh", 0.03))
 ENV_KEYWORDS = tuple(CFG["ik"].get("env_keywords", ["table", "wall", "floor", "ground"]))
-# Reachability prune: drop arm-vs-static pairs the arm can never approach closer
-# than prune_margin (conservative bounding-sphere bound over sampled arm configs).
-# The barrier jacobian is pure Python and linear in pair count — this is THE speed lever.
 PRUNE_SAMPLES = int(CFG["ik"].get("prune_samples", 20000))
 PRUNE_MARGIN = float(CFG["ik"].get("prune_margin", 0.05))
 
@@ -103,42 +75,28 @@ M = np.zeros((3, 3))
 for i in range(3):
     M[i, AXIS_MAP[i]] = AXIS_SIGN[i]
 
-# Per-axis sign for orientation only (robot base frame x,y,z); flip a component to
-# invert the sense of rotation about that axis without touching position mapping.
 ORI_SIGN = np.array(CFG["teleop"].get("ori_sign", [1.0, 1.0, 1.0]), float)
 
-# Nose within this angle of vertical at engage -> heading falls back to the
-# controller top axis (see yaw_frame); stored as the sine = horizontal-projection norm.
 YAW_FALLBACK_SIN = np.sin(np.radians(float(CFG["teleop"].get("yaw_fallback_deg", 15.0))))
 
-# Target shaping / latency:
 MAX_TARGET_SPEED = float(CFG["teleop"].get("max_target_speed", 1.2))
 MAX_LEAD = float(CFG["teleop"].get("max_lead", 0.08))
 MAX_ANG_SPEED = float(CFG["teleop"].get("max_ang_speed", 4.0))
 MAX_ANG_LEAD = float(CFG["teleop"].get("max_ang_lead", 0.5))
 ORI_ALPHA = float(CFG["teleop"].get("ori_alpha", 0.8))
 FILTER_MIN_CUTOFF = float(CFG["teleop"].get("filter_min_cutoff", 1.5))
-# beta is in Hz per (m/s): cutoff = min_cutoff + beta*|v|. Hand speeds are ~0.1-1 m/s,
-# so beta must be O(10) for the cutoff to actually open up in motion (low lag).
 FILTER_BETA = float(CFG["teleop"].get("filter_beta", 15.0))
 POSE_TIMEOUT = float(CFG["teleop"].get("pose_timeout", 0.2))
 JOINT_TIMEOUT = float(CFG["teleop"].get("joint_timeout", 0.3))
 BUTTONS_TIMEOUT = float(CFG["teleop"].get("buttons_timeout", 0.5))
 PAD_DEBOUNCE = float(CFG["teleop"].get("pad_debounce", 0.25))
 BLEND_TICKS = int(CFG["teleop"].get("disengage_blend_ticks", 5))
-# Keep this small on a UR5: the clamp allows a STANDING cmd-vs-measured offset while
-# the arm is blocked/paused, and the servo snaps through it on release.
 MAX_JOINT_LEAD = float(CFG["teleop"].get("max_joint_lead", 0.15))
 VR_RATE = float(CFG["teleop"].get("vr_rate", 250.0))
 VR_DT = 1.0 / VR_RATE
 MAX_TARGET_STEP = MAX_TARGET_SPEED * VR_DT
 MAX_ANG_STEP = MAX_ANG_SPEED * DT
 
-# Output command shaping: a dedicated thread republishes the IK result at
-# out_rate with per-joint velocity+acceleration limits, so the robot always sees
-# a dense stream with continuous velocity — no 100 Hz staircase beating against
-# the UR servo cycle (125 Hz on CB3), and any residual tick-level oscillation of
-# the IK output is attenuated below perception. out_rate 0 = old direct path.
 OUT_RATE = float(CFG["teleop"].get("out_rate", 250.0))
 OUT_VEL = float(CFG["teleop"].get("out_vel", 1.5))
 OUT_ACCEL = float(CFG["teleop"].get("out_accel", 10.0))
@@ -269,9 +227,8 @@ class CommandShaper:
             if delay > 0.0:
                 time.sleep(delay)
             else:
-                next_t = time.monotonic()  # fell behind (GIL/load): re-anchor, don't burst
+                next_t = time.monotonic()
             now = time.monotonic()
-            # measured dt (clamped) so velocity stays continuous through scheduling jitter
             dt = min(max(now - t_last, 0.25 * period), 4.0 * period)
             t_last = now
             with self._lock:
@@ -280,7 +237,7 @@ class CommandShaper:
             if tgt is None:
                 continue
             if not fresh:
-                self._q = None  # resync to the next fresh target (tick re-anchors it to measured)
+                self._q = None
                 continue
             q = self._step(tgt, dt)
             with self._lock:
@@ -367,8 +324,6 @@ class PinkIK:
                 q_ref[full.joints[full.getJointId(jname)].idx_q] = float(val)
             else:
                 self._warn(f"locked_q joint '{jname}' not in URDF, ignored")
-        # remember the pose every locked 1-dof joint was frozen at, so the Bridge can
-        # detect a mismatch vs the real parked robot and rebuild
         self.locked_ref = {}
         for jid in locked:
             j = full.joints[jid]
@@ -470,8 +425,6 @@ class PinkIK:
                 continue
             V = np.asarray(g.vertices())
             done = False
-            # coal.Convex rejects hulls with high-degree vertices ("Too many neighbors");
-            # decimating on a coarser grid smooths those apexes away
             for grid in (0.0, 0.002, 0.005, 0.01):
                 try:
                     Vg = V if grid == 0.0 else np.unique(np.round(V / grid) * grid, axis=0)
@@ -556,7 +509,6 @@ class PinkIK:
         self.geom.removeAllCollisionPairs()
         for cp in pairs:
             self.geom.addCollisionPair(cp)
-        # measure reference-pose distances to weed out permanently-near fixtures
         gd = self.geom.createData()
         dcol = self.model.createData()
         pin.computeDistances(self.model, dcol, self.geom, gd, pin.neutral(self.model))
@@ -589,7 +541,6 @@ class PinkIK:
         The barrier jacobian cost is linear in pair count — this is the speed lever."""
         if PRUNE_MARGIN <= 0.0 or PRUNE_SAMPLES <= 0 or len(self.geom.collisionPairs) == 0:
             return len(self.geom.collisionPairs)
-        # bounding sphere (local center + radius) per geometry
         centers, radii = [], []
         for go in self.geom.geometryObjects:
             try:
@@ -600,7 +551,7 @@ class PinkIK:
                 radii.append(0.5 * float(np.linalg.norm(mx - mn)))
             except Exception:
                 centers.append(np.zeros(3))
-                radii.append(1e3)  # unknown extent -> effectively never prune this geom
+                radii.append(1e3)
         rng = np.random.default_rng(0)
         lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
         qidx = [self.model.joints[self.model.getJointId(j)].idx_q for j in arm_joints]
@@ -609,10 +560,8 @@ class PinkIK:
         q = pin.neutral(self.model)
         moving = [gi for gi in range(len(self.geom.geometryObjects)) if on_arm(gi)]
         static = [gi for gi in range(len(self.geom.geometryObjects)) if not on_arm(gi)]
-        # static sphere centers in world (independent of arm config)
         pin.updateGeometryPlacements(self.model, d, self.geom, gd, q)
         c_static = {gi: gd.oMg[gi].rotation @ centers[gi] + gd.oMg[gi].translation for gi in static}
-        # phase 1: trace world sphere-centers of every arm geom over the samples
         samples = rng.uniform([lo[i] for i in qidx], [hi[i] for i in qidx], size=(PRUNE_SAMPLES, len(qidx)))
         traces = {gi: np.empty((PRUNE_SAMPLES, 3)) for gi in moving}
         for si, s in enumerate(samples):
@@ -622,7 +571,6 @@ class PinkIK:
             pin.updateGeometryPlacements(self.model, d, self.geom, gd)
             for gi in moving:
                 traces[gi][si] = gd.oMg[gi].rotation @ centers[gi] + gd.oMg[gi].translation
-        # phase 2: per pair, vectorized lower bound of the achievable distance
         keep = []
         for cp in self.geom.collisionPairs:
             a, b = cp.first, cp.second
@@ -789,8 +737,6 @@ class PinkIK:
             q_new = self._retreat(q_prec, dt)
         if not np.array_equal(q_new, self.configuration.q):
             self.configuration.update(q_new)
-        # "near collision" = within (d_influence - d_min) of the pair's own floor,
-        # so self pairs with a small floor don't flag it permanently
         self.blocked = self.min_gap()[1] < (D_INFLUENCE - D_MIN)
         return self.arm_positions()
 
@@ -853,10 +799,6 @@ class Bridge(Node):
             self.shaper = CommandShaper(self.pub, OUT_RATE, OUT_VEL, OUT_ACCEL, OUT_KP)
             self.shaper.start()
             self.get_logger().info(f"CommandShaper: {OUT_RATE:.0f} Hz, v_max={OUT_VEL}, a_max={OUT_ACCEL}, kp={OUT_KP}")
-        # best-effort keep-last on streams: never build a stale backlog. vive topics have
-        # a single publisher -> depth 1 (latest only). /joint_states is SHARED by several
-        # broadcasters (arms + hand) -> depth 5, or a burst from one publisher displaces
-        # the other's message in a depth-1 queue and the arm freshness watchdog flaps.
         qos_latest = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
         qos_js = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(JointState, JOINT_STATES_TOPIC, self.on_joint_states, qos_js)
@@ -943,8 +885,6 @@ class Bridge(Node):
         if np.linalg.det(Rc) < 0.0:
             Rc[:, -1] *= -1.0
         now = time.monotonic()
-        # first pose after a stale gap: reset the filter, otherwise it blends the
-        # pre-dropout position in and the anchor lands centimeters off the hand
         if self._cur is not None and (now - self._pose_t) >= POSE_TIMEOUT:
             self._pos_filter.t_prev = None
         self._cur = self._pos_filter(arr[:3], now)
@@ -1057,8 +997,6 @@ class Bridge(Node):
                 rel0 = newp - self.shoulder
                 az0 = np.arctan2(arel[1], arel[0])
                 az = np.arctan2(rel0[1], rel0[0])
-                # saturate so the amplified azimuth can't cross the antipode: the raw
-                # wrap at +-pi would flip the target to the mirrored side of the base
                 daz_max = np.pi / max(AZ_GAIN, 1.0)
                 daz = np.clip((az - az0 + np.pi) % (2 * np.pi) - np.pi, -daz_max, daz_max)
                 naz = az0 + AZ_GAIN * daz
@@ -1088,7 +1026,6 @@ class Bridge(Node):
         pad = self._pad_now
         menu = self._menu_now
         if pad and not self._pad_was and (now - self._pad_t) > PAD_DEBOUNCE:
-            # freeze must ALWAYS work (it needs no pose); only engage requires a fresh pose
             if self.shared["engaged"]:
                 self._pad_t = now
                 self._on_disengage()
@@ -1159,10 +1096,6 @@ class Bridge(Node):
             else:
                 self.eff = em
         if all(j in nm for j in ARM):
-            # freshness = ARRIVAL time of a message carrying the arm joints. (Do NOT
-            # use msg.header.stamp: Gazebo stamps sim-time, which vs the node's wall
-            # clock yields a ~1e9 s "age" and makes joint_states look permanently stale.
-            # depth-5 KEEP_LAST QoS already bounds any post-dropout backlog.)
             self._js_t = time.monotonic()
         if not all(j in self.pos for j in ARM_CMD_JOINTS):
             return
@@ -1194,10 +1127,6 @@ class Bridge(Node):
         if self.phase != "teleop":
             return
 
-        # joint_states watchdog: while measurements are stale, HOLD the IK integrator
-        # (otherwise it free-runs away from the physically held robot and the recovery
-        # tick would publish a violent multi-joint step); on recovery, re-sync to the
-        # measured state exactly like a freeze does and re-anchor the controller refs.
         if not self._joints_fresh():
             self._joints_lost = True
             self.get_logger().warn("joint_states stale -> IK held", throttle_duration_sec=1.0)
@@ -1213,7 +1142,7 @@ class Bridge(Node):
             self.shared["target"] = self.ik.fk_translation()
             self._R_des_prev = None
             if self.shared["engaged"]:
-                self._pose_lost = True  # forces _capture_refs() on the next fresh pose
+                self._pose_lost = True
             self.get_logger().warn("joint_states recovered -> re-synced to measured")
 
         tgt = self.shared["target"].copy()
@@ -1221,13 +1150,6 @@ class Bridge(Node):
         engaged = self.shared["engaged"]
 
         if engaged and self.Rc_ref is not None:
-            # Heading-normalize the orientation delta by the ENGAGE yaw frame (the
-            # same _R_ref the position path uses). The raw world-frame delta axis
-            # rotates with the controller's absolute heading, so the same wrist
-            # gesture pitched the gripper DOWN at one engage heading and UP at the
-            # opposite one (approach flip). NOTE: goes together with ori_sign
-            # [1,1,1] — the old [-1,-1,1] was the 180deg-about-vertical compensator
-            # for the raw VR-universe heading, which _R_ref now removes per-engage.
             dR = self._R_ref.T @ (Rc @ self.Rc_ref.T) @ self._R_ref
             w = ORI_SIGN * pin.log3(M @ dR @ M.T)
             R_des = pin.exp3(w) @ self.R_anchor
@@ -1250,11 +1172,9 @@ class Bridge(Node):
             lead = q_arm - meas
             mlead = float(np.max(np.abs(lead)))
             if mlead > MAX_JOINT_LEAD:
-                # uniform scale keeps the command on the meas->cmd line (a per-joint box
-                # clamp mixes a corner configuration the barrier never certified)
                 self.ik.set_arm(meas + lead * (MAX_JOINT_LEAD / mlead))
                 if self.ik.geom is not None and self.ik.min_gap()[1] < 0 and self._last_cmd is not None:
-                    self.ik.set_arm(self._last_cmd)  # scaled cmd violates the barrier floor -> hold last safe cmd
+                    self.ik.set_arm(self._last_cmd)
                 q_arm = self.ik.arm_positions()
                 self.get_logger().warn("cmd ran ahead of robot -> clamped to measured + max_joint_lead", throttle_duration_sec=1.0)
 
@@ -1296,8 +1216,6 @@ class Bridge(Node):
         self._last_cmd = q_arm.copy()
         self.send_arm(q_arm)
 
-        # gripper: only act on fresh controller input, so a controller/publisher dropout
-        # latches the last grip state instead of auto-opening and dropping the object
         now = time.monotonic()
         if (now - self._btn_t) < BUTTONS_TIMEOUT:
             down = self._trig_now > 0.5
