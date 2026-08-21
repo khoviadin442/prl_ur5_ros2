@@ -56,19 +56,29 @@ FRESH_WS=0
 if [[ -d "$WS/src/prl_ur5_ros2" ]]; then
     echo "  already present, sources left untouched"
 else
-    command -v vcs >/dev/null || { echo "  vcstool missing: sudo apt install python3-vcstool"; exit 1; }
     mkdir -p "$WS/src"
     git clone https://github.com/inria-paris-robotics-lab/prl_ur5_ros2.git "$WS/src/prl_ur5_ros2"
-    (cd "$WS/src" && vcs import . < prl_ur5_ros2/dependencies.repos)
+    if command -v vcs >/dev/null; then
+        (cd "$WS/src" && vcs import . < prl_ur5_ros2/dependencies.repos)
+    else
+        echo "  vcstool not installed, cloning the dependency list directly"
+        I=https://github.com/inria-paris-robotics-lab
+        git clone -b ros2 $I/prl_ur5_robot_configuration.git "$WS/src/prl_ur5_robot_configuration"
+        git clone -b ros2 $I/robotiq.git                     "$WS/src/robotiq"
+        git clone -b ros2 $I/onrobot_ros.git                 "$WS/src/onrobot_ros"
+        git clone       $I/wsg50-ros-pkg.git                 "$WS/src/wsg50-ros-pkg"
+        git clone       $I/prl_ur5_calibration.git           "$WS/src/prl_ur5_calibration"
+        git clone       $I/allegro_hand_ros_v4.git           "$WS/src/allegro_hand_ros_v4"
+    fi
     FRESH_WS=1
-    echo "  cloned prl_ur5_ros2 + dependencies.repos"
+    echo "  cloned prl_ur5_ros2 + its dependencies"
 fi
 
 say "workspace patches"
 if [[ $FRESH_WS -eq 1 || $FORCE_PATCHES -eq 1 ]]; then
-    rsync -a "$SRC/patches/wsg50-ros-pkg/"               "$WS/src/wsg50-ros-pkg/"
-    rsync -a "$SRC/patches/prl_ur5_robot_configuration/" "$WS/src/prl_ur5_robot_configuration/"
-    rsync -a "$SRC/patches/prl_ur5_ros2/prl_ur5_gazebo/" "$WS/src/prl_ur5_ros2/prl_ur5_gazebo/"
+    cp -a "$SRC/patches/wsg50-ros-pkg/."               "$WS/src/wsg50-ros-pkg/"
+    cp -a "$SRC/patches/prl_ur5_robot_configuration/." "$WS/src/prl_ur5_robot_configuration/"
+    cp -a "$SRC/patches/prl_ur5_ros2/prl_ur5_gazebo/." "$WS/src/prl_ur5_ros2/prl_ur5_gazebo/"
     echo "  applied to wsg50-ros-pkg, prl_ur5_robot_configuration, prl_ur5_gazebo"
 else
     echo "  workspace was already there, patches NOT applied (--force-patches to apply)"
