@@ -41,17 +41,25 @@ git clone https://github.com/khoviadin442/prl_ur5_ros2.git ~/rabota/prl_ur5_ros2
 cd ~/rabota/prl_ur5_ros2 && git checkout mantis-teleop
 ./mantis_teleop/setup_workstation.sh          # reports the container packages as MISSING
 
-# 2. the image and the container (the first run builds the image, ~30 min)
+# 2. the host ROS environment (see Requirements below); step 5 needs its xacro
+git clone https://github.com/khoviadin442/SO-100-HTC-vive-teleop.git \
+    ~/rabota/SO-100-HTC-vive-teleop
+cd ~/rabota/SO-100-HTC-vive-teleop && pixi install
+
+# 3. the image and the container (the first run builds the image, ~30 min)
 cd ~/rabota/prl_ur5_ros2/docker-ros2
 ./start_docker.bash mantis ~/rabota/docker_shared
 
-# 3. inside the container
+# 4. inside the container
 cd ~/share/mantis_ws && colcon build --symlink-install
 pip install -e ~/share/lerobot_robot_mantis   # only needed for replay, see below
 
-# 4. back on the host, with the container still up
+# 5. back on the host, with the container still up
 cd ~/rabota/prl_ur5_ros2 && ./mantis_teleop/setup_workstation.sh   # "generated (N lines)"
 ```
+
+When something in there does not go as written, [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+lists the failures this setup is known to produce and what each one means.
 
 `setup_workstation.sh` copies the teleop files into the container share dir
 (`~/rabota/docker_shared`), clones and patches `mantis_ws`, builds the host package
@@ -62,21 +70,36 @@ prefix and generates `mantis.urdf`. It never overwrites what is already there â€
 
 The workspace build lives in the share dir, so it survives the container; the editable
 `lerobot_robot_mantis` install does not, because `start_docker.bash` runs with `--rm`.
-Repeat step 3's `pip install` in each new container that needs `run_replay.sh`.
-
-The host publisher needs its own ROS environment (see below); with the SO-100 pixi
-workspace that is `git clone` + `pixi install && pixi run build`.
+Repeat step 4's `pip install` in each new container that needs `run_replay.sh`.
 
 ## Requirements
 
 * **Container side** (the docker image from `prl_ur5_ros2/docker-ros2`): ROS 2 Jazzy,
   the `mantis_ws` workspace built, `pinocchio`, `pin-pink`, `qpsolvers`, `scipy`;
-  `pip install lerobot` only if episodes are recorded.
-* **Host side**: a ROS 2 environment with `rclpy` plus either `openvr` (ALVR + SteamVR)
-  or `oculus_reader` + `pure-python-adb` (USB backend).
-* Quest 2 in developer mode, `android-tools-adb` installed.
+  `pip install lerobot` only if episodes are recorded. The Dockerfile in this fork
+  installs all of it.
+* **Host side**: a ROS 2 environment where `python -c "import rclpy, numpy, openvr"`
+  passes (ALVR/SteamVR backend), or `import rclpy, numpy, oculus_reader, ppadb` for the
+  USB backend. `run_teleop_quest.sh`, which runs everything on the host without the
+  container, additionally needs `pinocchio`, `pink`, `qpsolvers`, `scipy` and `coal`.
+* Quest 2 in developer mode, and `adb` on the host for the USB backend.
 
-The launch scripts source the host ROS environment from
+Any environment satisfying that works. The one the teleop was developed against is a
+pixi workspace that needs no root, and its `pixi.toml` already lists every package
+above:
+
+```bash
+git clone https://github.com/khoviadin442/SO-100-HTC-vive-teleop.git \
+    ~/rabota/SO-100-HTC-vive-teleop
+cd ~/rabota/SO-100-HTC-vive-teleop && pixi install
+source .pixi/envs/default/setup.bash
+which python && python -c "import rclpy, numpy, openvr; print('host env OK')"
+```
+
+`which python` has to point inside `.pixi/envs/default/bin`; if it does not, the launch
+scripts will pick up the system python and fail on `import openvr`.
+
+The launch scripts source that environment from
 `../SO-100-HTC-vive-teleop/.pixi/envs/default/setup.bash` by default. On a machine where
 it lives elsewhere, point the env vars at it instead of editing the scripts:
 
