@@ -254,15 +254,23 @@ WORKDIR /home/${USERNAME}
 # Create a directory to store data
 RUN mkdir share
 
+## pip is not pulled in by any of the layers above, and everything below needs it.
+RUN sudo apt-get update \
+ && sudo apt-get install -y --no-install-recommends python3-pip \
+ && sudo rm -rf /var/lib/apt/lists/*
+
 ## VR teleop python stack: pinocchio + pink (collision barrier) + the QP solver.
+## typing_extensions is an undeclared dependency of pink.tasks.
 RUN pip3 install --user --break-system-packages --no-cache-dir \
       "pin==4.0.0" "pin-pink==4.2.0" "coal==3.0.3" "scipy>=1.14" qpsolvers daqp \
+      typing_extensions \
  && python3 -c "import pinocchio, coal; from pink.barriers import SelfCollisionBarrier; import qpsolvers; assert 'daqp' in qpsolvers.available_solvers; print('teleop deps OK:', pinocchio.__version__)"
 
 ## LeRobot episode recording and replay. torch is pinned to the CPU build (lerobot
 ## alone pulls ~5 GB of CUDA wheels this container has no GPU for) and numpy is
-## constrained so the pinocchio ABI stays intact.
-RUN echo "numpy==2.5.1" > /tmp/np.txt \
+## constrained so the pinocchio ABI stays intact. setuptools is held below 80, which
+## dropped the `develop` command colcon needs for --symlink-install.
+RUN printf 'numpy==2.5.1\nsetuptools<80\n' > /tmp/np.txt \
  && pip3 install --user --break-system-packages --no-cache-dir -c /tmp/np.txt \
       "torch==2.10.0+cpu" "torchvision==0.25.0+cpu" --index-url https://download.pytorch.org/whl/cpu \
  && pip3 install --user --break-system-packages --no-cache-dir -c /tmp/np.txt \

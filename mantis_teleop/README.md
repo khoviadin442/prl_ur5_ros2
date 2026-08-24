@@ -23,35 +23,49 @@ operator hand ──► quest_pub.py ──► /vive/pose, /vive/buttons ──�
 | `lerobot_robot_mantis/` | lerobot plugin registering `--robot.type=mantis_follower` for replay |
 | `run_*.sh` | launch wrappers (see below) |
 | `setup_workstation.sh` | one-shot setup of a new machine: share dir, workspace, patches, host prefix, URDF |
+| `TROUBLESHOOTING.md` | what the failures seen while setting a machine up actually mean |
 | `fastdds_udp_only.xml` | UDP-only DDS profile, needed for host <-> container traffic |
 | `patches/` | changes made to the ROS workspace packages, mirrored by path |
 
 ## Setting up a new machine
 
+Everything except the robot stack runs out of one container, so the host needs only
+`git`, a working `docker`, and — for the Quest over USB — `adb`. Setup is two passes of
+the same script: the first one lays out the workspace, the second one (once the
+container exists) pulls the ROS packages that only live inside the image and writes the
+URDF the teleop loads.
+
 ```bash
-sudo apt install -y git docker.io android-tools-adb python3-vcstool rsync
-git clone git@github.com:khoviadin442/prl_ur5_ros2.git ~/rabota/prl_ur5_ros2
+# 1. the repository
+git clone https://github.com/khoviadin442/prl_ur5_ros2.git ~/rabota/prl_ur5_ros2
 cd ~/rabota/prl_ur5_ros2 && git checkout mantis-teleop
-./mantis_teleop/setup_workstation.sh
+./mantis_teleop/setup_workstation.sh          # reports the container packages as MISSING
+
+# 2. the image and the container (the first run builds the image, ~30 min)
+cd ~/rabota/prl_ur5_ros2/docker-ros2
+./start_docker.bash mantis ~/rabota/docker_shared
+
+# 3. inside the container
+cd ~/share/mantis_ws && colcon build --symlink-install
+pip install -e ~/share/lerobot_robot_mantis   # only needed for replay, see below
+
+# 4. back on the host, with the container still up
+cd ~/rabota/prl_ur5_ros2 && ./mantis_teleop/setup_workstation.sh   # "generated (N lines)"
 ```
 
 `setup_workstation.sh` copies the teleop files into the container share dir
 (`~/rabota/docker_shared`), clones and patches `mantis_ws`, builds the host package
 prefix and generates `mantis.urdf`. It never overwrites what is already there — pass
-`--force-files` / `--force-patches` when that is what you want. Then build the image and
-the workspace:
+`--force-files` / `--force-patches` when that is what you want, and delete
+`mantis_ws/mantis.urdf` to have it regenerated. Paths are overridable through
+`SHARE_DIR`, `HOST_DEPS`, `CONTAINER_NAME` and `ROS_SETUP`.
 
-```bash
-cd ~/rabota/prl_ur5_ros2/docker-ros2
-./start_docker.bash mantis ~/rabota/docker_shared        # first run builds the image
-# inside the container:
-cd ~/share/mantis_ws && colcon build --symlink-install
-pip install -e ~/share/lerobot_robot_mantis              # only needed for replay
-```
+The workspace build lives in the share dir, so it survives the container; the editable
+`lerobot_robot_mantis` install does not, because `start_docker.bash` runs with `--rm`.
+Repeat step 3's `pip install` in each new container that needs `run_replay.sh`.
 
 The host publisher needs its own ROS environment (see below); with the SO-100 pixi
-workspace that is `git clone` + `pixi install && pixi run build`. Re-run
-`setup_workstation.sh` once the container is up if it reported `ur_description MISSING`.
+workspace that is `git clone` + `pixi install && pixi run build`.
 
 ## Requirements
 
@@ -106,22 +120,33 @@ that branch and the copies here are kept only for reference.
 | `wsg50-ros-pkg/wsg_50_interface/**` | gripper commands moved off the ros2_control RT loop; open uses ACK + MOVE so a latched fast-stop cannot leave the fingers shut |
 | `wsg50-ros-pkg/wsg_50_driver/config/wsg50_setup.yaml` | gripper IP, force and speed |
 | `wsg50-ros-pkg/wsg_50_simulation/urdf/wsg_50.urdf.xacro` | wider finger collision meshes + the wire-box connector link |
-| `prl_ur5_ros2/docker-ros2/Dockerfile` | teleop python stack (pinocchio 4 + pink + qpsolvers/daqp), CPU-only torch + lerobot, and the LD_LIBRARY_PATH that makes the pip pinocchio win |
+| `prl_ur5_ros2/docker-ros2/Dockerfile` | `python3-pip`, the teleop python stack (pinocchio 4 + pink + qpsolvers/daqp), CPU-only torch + lerobot, the LD_LIBRARY_PATH that makes the pip pinocchio win, and two version pins: `setuptools<80` (80 dropped the `develop` command `colcon --symlink-install` needs) and `typing_extensions` (undeclared dependency of `pink.tasks`) |
 | `prl_ur5_ros2/docker-ros2/start_docker.bash` | `--ipc=host` |
 | `prl_ur5_ros2/prl_ur5_gazebo/launch/start_gazebo_sim.launch.py` | bullet-featherstone world for mimic-joint grippers |
 
 After changing the robot configuration, regenerate the URDF the teleop loads
-(`urdf:` in the config, by default `mantis_ws/mantis.urdf`):
+(`urdf:` in the config, by default `mantis_ws/mantis.urdf`). Delete it and re-run the
+setup script with the container up:
 
 ```bash
-source "$ROS_SETUP"
-export AMENT_PREFIX_PATH="$HOST_DEPS:$AMENT_PREFIX_PATH"
-python -c "import xacro; open('/tmp/m.urdf','w').write(
-    xacro.process_file('<mantis_ws>/src/prl_ur5_ros2/prl_ur5_description/urdf/mantis.urdf.xacro',
-                       mappings={'gz_sim':'true'}).toprettyxml(indent='  '))"
-sed -e "s|file://$HOST_DEPS/share/ur_description|package://ur_description|g" \
-    -e "s|file://$HOST_DEPS/share/prl_ur5_description|package://prl_ur5_description|g" \
-    /tmp/m.urdf > <mantis_ws>/mantis.urdf
+rm ~/rabota/docker_shared/mantis_ws/mantis.urdf
+./mantis_teleop/setup_workstation.sh          # "generated (N lines)"
+```
+
+The script runs `mantis.urdf.xacro` against the host package prefix it builds in
+`$HOST_DEPS` (default `~/rabota/mantis_host_deps/fakeprefix`) and rewrites the resulting
+absolute mesh paths back into `package://` URIs, which both the host and the container
+resolve through `AMENT_PREFIX_PATH`. The prefix needs an `ament_index` entry per package
+for `$(find ...)` to see it, which is why it is built by the script rather than by hand;
+five of its packages exist only inside the image and are copied out of the running
+container.
+
+A quick sanity check on a regenerated URDF — the gripper wire box must be in it, and no
+absolute mesh path may survive:
+
+```bash
+grep -c 'left_gripper_connector_link' ~/rabota/docker_shared/mantis_ws/mantis.urdf   # 2
+grep -o 'package://[a-z0-9_]*' ~/rabota/docker_shared/mantis_ws/mantis.urdf | sort -u
 ```
 
 ## Running

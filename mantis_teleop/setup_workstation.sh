@@ -85,28 +85,55 @@ else
 fi
 
 say "host package prefix: $FP"
-mkdir -p "$FP/share"
-ln -sfn "$WS/src/prl_ur5_ros2/prl_ur5_description"    "$FP/share/prl_ur5_description"
-ln -sfn "$WS/src/wsg50-ros-pkg/wsg_50_simulation"     "$FP/share/wsg_50_simulation"
-ln -sfn "$WS/src/prl_ur5_robot_configuration"         "$FP/share/prl_ur5_robot_configuration"
-echo "  linked prl_ur5_description, wsg_50_simulation, prl_ur5_robot_configuration"
+IDX="$FP/share/ament_index/resource_index/packages"
+mkdir -p "$IDX"
 
-if [[ -d "$FP/share/ur_description" ]]; then
-    echo "  ur_description already present"
+# Every package the mantis xacro resolves with $(find ...), linked out of the workspace
+# sources. The ament index entry is what makes $(find ...) see them at all.
+for entry in \
+    "prl_ur5_description:prl_ur5_ros2/prl_ur5_description" \
+    "prl_ur5_control:prl_ur5_ros2/prl_ur5_control" \
+    "prl_ur5_robot_configuration:prl_ur5_robot_configuration" \
+    "wsg_50_simulation:wsg50-ros-pkg/wsg_50_simulation" \
+    "wsg_50_driver:wsg50-ros-pkg/wsg_50_driver" \
+    "robotiq_ft_sensor_description:robotiq/robotiq_ft_sensor/robotiq_ft_sensor_description" \
+    "allegro_hand_description:allegro_hand_ros_v4/allegro_hand_description" \
+    "onrobot_description:onrobot_ros/onrobot_description" ; do
+    pkg="${entry%%:*}"
+    ln -sfn "$WS/src/${entry#*:}" "$FP/share/$pkg"
+    touch "$IDX/$pkg"
+done
+echo "  linked 8 packages out of $WS/src"
+
+# The rest only exist inside the image: ROS packages under /opt/ros, and the Orbbec
+# driver the Dockerfile builds from source.
+MISSING=""
+for pkg in ur_description ur_robot_driver ur_client_library realsense2_description orbbec_description; do
+    [[ -d "$FP/share/$pkg" ]] && { touch "$IDX/$pkg"; continue; }
+    MISSING="$MISSING $pkg"
+done
+if [[ -z "$MISSING" ]]; then
+    echo "  container packages already present"
 elif docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
-    docker exec "$CONTAINER" tar cC /opt/ros/jazzy/share -f - ur_description | tar xf - -C "$FP/share"
-    echo "  ur_description copied out of container '$CONTAINER'"
+    for pkg in $MISSING; do
+        if docker exec "$CONTAINER" test -d "/opt/ros/jazzy/share/$pkg"; then
+            docker exec "$CONTAINER" tar cC /opt/ros/jazzy/share -f - "$pkg" | tar xf - -C "$FP/share"
+        else
+            docker exec "$CONTAINER" tar cC "/home/ros/ros2_utils_ws/install/$pkg/share" -f - "$pkg" | tar xf - -C "$FP/share"
+        fi
+        touch "$IDX/$pkg"
+    done
+    echo "  copied$MISSING out of container '$CONTAINER'"
 else
-    echo "  ur_description MISSING: start the container, then run this script again"
-    echo "    (or: docker exec $CONTAINER tar cC /opt/ros/jazzy/share -f - ur_description | tar xf - -C $FP/share)"
+    echo "  MISSING$MISSING: start the container, then run this script again"
 fi
 
 say "URDF: $WS/mantis.urdf"
 ROS_SETUP="${ROS_SETUP:-$HOME/rabota/SO-100-HTC-vive-teleop/.pixi/envs/default/setup.bash}"
 if [[ -f "$WS/mantis.urdf" ]]; then
     echo "  already generated, left as is (delete it to regenerate)"
-elif [[ ! -d "$FP/share/ur_description" ]]; then
-    echo "  skipped: ur_description is not in the prefix yet"
+elif [[ ! -d "$FP/share/ur_description" || ! -d "$FP/share/orbbec_description" ]]; then
+    echo "  skipped: the container packages are not in the prefix yet"
 elif [[ ! -f "$ROS_SETUP" ]]; then
     echo "  skipped: host ROS env not found at $ROS_SETUP (set ROS_SETUP)"
 else
@@ -115,9 +142,9 @@ else
     set -u
     export AMENT_PREFIX_PATH="$FP:${AMENT_PREFIX_PATH:-}"
     python -c "import xacro; open('/tmp/mantis_gen.urdf','w').write(xacro.process_file('$WS/src/prl_ur5_ros2/prl_ur5_description/urdf/mantis.urdf.xacro', mappings={'gz_sim':'true'}).toprettyxml(indent='  '))"
-    sed -e "s|file://$FP/share/ur_description|package://ur_description|g" \
-        -e "s|file://$FP/share/prl_ur5_description|package://prl_ur5_description|g" \
-        /tmp/mantis_gen.urdf > "$WS/mantis.urdf"
+    # Mesh paths come out pointing into the host prefix; the teleop resolves package://
+    # against AMENT_PREFIX_PATH, so it works on the host and inside the container alike.
+    sed -e "s|file://$FP/share/|package://|g" /tmp/mantis_gen.urdf > "$WS/mantis.urdf"
     echo "  generated ($(wc -l < "$WS/mantis.urdf") lines)"
 fi
 
