@@ -15,9 +15,43 @@ which python && python -c "import rclpy, openvr, pinocchio, pink; print('host en
 
 # container
 python3 -c "import pinocchio, pink, qpsolvers, lerobot; print('deps OK')"
-ros2 topic hz /vive/pose                                 # ~250 Hz over ALVR, ~72 Hz over adb
+ros2 topic hz /vive/pose                                 # healthy ~70 Hz (adb) / ~250 Hz (ALVR)
 ros2 topic echo /vive/buttons                            # 6 fields
 ```
+
+## Motion is choppy / the gripper lags / it gets worse after a while
+
+By far the most common runtime complaint, and it is almost always the **Quest tracking
+stream**, not the robot or the code. When the headset can no longer see the controller
+well it drops from 6-DOF to orientation-only tracking, and the pose stream falls from
+~70 Hz to ~50 Hz and jittery. The arm turns choppy, recordings show flicks, and the
+gripper's press → start delay grows (its button state only refreshes with each pose
+sample). Classic tell: fine at the start of the day, degrades after a couple of hours.
+
+The teleop logs **`QUEST POSE RATE LOW`** when `/vive/pose` drops below
+`teleop.pose_hz_warn` (65 Hz). Confirm and fix:
+
+```bash
+ros2 topic hz /vive/pose        # ~50 Hz instead of ~70 Hz confirms it
+adb shell dumpsys OVRRemoteService | grep -iE "TrackingStatus|tracking lost"
+#   TrackingStatus: ORIENTATION (+ a climbing "tracking lost count") = the headset lost the controller
+```
+
+Fixes, in order:
+
+1. **Reboot the headset** — resets heat and tracking to the "start of day" state:
+   `adb reboot`, then restart `run_quest_pub.sh`.
+2. Keep the headset's cameras **looking at the controller** (wear it, or aim it at the
+   workspace), in **even light** — no glare, dark corners, or blank/reflective walls.
+3. Keep the headset **cool** (a fan; don't run it continuously for hours) and put a
+   **fresh AA** in the controller.
+
+Restarting `quest_pub` or `adb` does **not** fix it — the fault is on the headset side.
+`run_quest_pub.sh` already defaults to `QUEST_ADB_MODE=extrapolate`, which keeps the arm
+smooth at ~50 Hz, but it cannot repair bad tracking, so still reboot when the warning fires.
+
+For a full picture across a session (pose rate over time, camera loss, thermals, network),
+run `teleop_monitor.py start` before the session and `teleop_monitor.py report` after.
 
 ## The container has no `pip`, `pinocchio` or `lerobot`
 
