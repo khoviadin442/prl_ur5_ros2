@@ -46,6 +46,20 @@ SHOULDER_JOINT = CFG.get("shoulder_joint", "left_shoulder_lift_joint")
 LOCKED_Q = dict(CFG.get("locked_q") or {})
 LOCK_OPEN = list(CFG.get("ik", {}).get("lock_open_joints", ["left_gripper_joint"]))
 
+# Robot-shape generalization. Every default below reproduces the mantis 6-DOF UR5 exactly, so
+# an existing config is unchanged; a differently shaped arm (e.g. a 7-DOF Franka) overrides them
+# in its own config.
+#   reach_shell_joints : joints varied to sample the reach envelope; default = all but the last
+#                        two orientation joints (ARM[:4] on a 6-DOF arm).
+#   roll_joint         : the tool-roll joint for the pour gesture; default = the last arm joint
+#                        (wrist_3 on a UR, joint7 on a Franka).
+#   wrist_vel_joints   : joints capped at ik.wrist_vel_scale; default = any joint named "*wrist*".
+#   sing_report_joint  : joint value shown in the near-singularity log (diagnostic only).
+REACH_SHELL_JOINTS = list(CFG["teleop"].get("reach_shell_joints") or ARM[:max(1, len(ARM) - 2)])
+ROLL_JOINT = CFG["teleop"].get("roll_joint")            # None -> the last arm joint
+WRIST_VEL_JOINTS = CFG["ik"].get("wrist_vel_joints")    # None -> substring match on "wrist"
+SING_REPORT_JOINT = CFG["teleop"].get("sing_report_joint") or (ARM[4] if len(ARM) > 4 else ARM[-1])
+
 RATE = float(CFG["rate"])
 DT = 1.0 / RATE
 
@@ -540,7 +554,7 @@ class PinkIK:
         self.ee = ee_frame
         self.arm_joints = list(arm_joints)
         self._qidx = {j: self.model.joints[self.model.getJointId(j)].idx_q for j in self.arm_joints}
-        self._roll_joint = self.arm_joints[-1]
+        self._roll_joint = ROLL_JOINT or self.arm_joints[-1]
         self._a3_local = self._joint_axis_local(self._roll_joint)
         self._roll_pairs_idx = None
         self.fix_limits(vel_scale)
@@ -919,7 +933,8 @@ class PinkIK:
         scale = np.full(vl.shape, float(vel_scale))
         if WRIST_VEL_SCALE > 0.0:
             for j in self.arm_joints:
-                if "wrist" in j and self.model.existJointName(j):
+                is_wrist = (j in WRIST_VEL_JOINTS) if WRIST_VEL_JOINTS is not None else ("wrist" in j)
+                if is_wrist and self.model.existJointName(j):
                     scale[self.model.joints[self.model.getJointId(j)].idx_v] = WRIST_VEL_SCALE
             self._info(f"wrist_vel_scale={WRIST_VEL_SCALE} on wrist joints (others x{vel_scale})")
         self.model.velocityLimit = vl * scale
@@ -1418,7 +1433,7 @@ class Bridge(Node):
         rng = np.random.default_rng(seed)
         lo_lim = self.model.lowerPositionLimit
         hi_lim = self.model.upperPositionLimit
-        qidx = [self.ik.qindex(j) for j in ARM[:4]]
+        qidx = [self.ik.qindex(j) for j in REACH_SHELL_JOINTS]
         q = self.ik.neutral()
         lo_d, hi_d = 1e9, 0.0
         samples = rng.uniform([lo_lim[i] for i in qidx], [hi_lim[i] for i in qidx], size=(n, len(qidx)))
@@ -2458,7 +2473,7 @@ class Bridge(Node):
         if SING_SIGMA0 > 0.0 and self.ik.sigma_min < SING_SIGMA0:
             self.get_logger().info(
                 f"near {self.ik.sing_kind} singularity (sigma={self.ik.sigma_min:.4f}, "
-                f"{ARM[4]}={self.pos.get(ARM[4], float('nan')):+.3f}) -> IK damped",
+                f"{SING_REPORT_JOINT}={self.pos.get(SING_REPORT_JOINT, float('nan')):+.3f}) -> IK damped",
                 throttle_duration_sec=1.0)
         v_ff = None
         if OUT_FF:

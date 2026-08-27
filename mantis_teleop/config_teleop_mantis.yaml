@@ -19,6 +19,16 @@ arm_cmd_joints: [left_shoulder_pan_joint, left_shoulder_lift_joint, left_elbow_j
 locked_q: {}
 rate: 100.0                   # Hz, IK tick
 
+# --- Porting to a differently shaped arm (e.g. 7-DOF Franka) --------------------------------
+# The teleop is otherwise robot-agnostic: the URDF/SRDF and the joint lists above drive it.
+# For an arm that is not a 6-DOF UR, override these optional keys. Omitted, each defaults to the
+# 6-DOF UR behavior, so this mantis config is unchanged:
+#   teleop.reach_shell_joints : [j1, j2, ...]  base joints varied to sample reach (default: all but the last 2)
+#   teleop.roll_joint         : <joint>        tool-roll joint for the pour gesture (default: the last arm joint)
+#   teleop.sing_report_joint  : <joint>        joint shown in the near-singularity log (diagnostic; default: 5th)
+#   ik.wrist_vel_joints       : [j, ...]       joints capped at ik.wrist_vel_scale (default: any joint named *wrist*)
+# -------------------------------------------------------------------------------------------
+
 ik:
   position_cost: 2.0
   orientation_cost: 0.9       # 6-DOF arm: orientation is controllable, position still dominates
