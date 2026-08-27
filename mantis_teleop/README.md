@@ -19,8 +19,9 @@ operator hand ─► quest_pub.py ─► /vive/pose, /vive/buttons ─► teleop
 
 **Contents:** [What you need](#what-you-need) · [Install](#install) · [First run](#first-run-smoke-test)
 · [Running](#running) · [Controls](#controls-right-touch-controller) · [Recording a dataset](#recording-a-dataset)
-· [Replay](#replay) · [Health check & diagnostics](#health-check--diagnostics) · [Troubleshooting](TROUBLESHOOTING.md)
-· [Files](#files) · [Workspace patches](#workspace-patches) · [Environment variables](#environment-variables-quest_pubpy)
+· [Replay](#replay) · [Health check & diagnostics](#health-check--diagnostics) · [How it works](#how-it-works)
+· [Troubleshooting](TROUBLESHOOTING.md) · [Files](#files) · [Workspace patches](#workspace-patches)
+· [Environment variables](#environment-variables-quest_pubpy)
 
 ---
 
@@ -120,6 +121,47 @@ Plug in the headset, accept the "Allow USB debugging" prompt inside the Quest, a
 ```bash
 adb devices          # the headset must be listed as 'device', not 'unauthorized' / 'no permissions'
 ```
+
+### ADB on the lab PC (adb server in a container)
+
+The Quest talks to the workstation over `adb`. Rather than depend on the host's adb version
+and USB permissions, this rig runs the **adb server itself inside a small privileged
+container** that owns the USB bus and shares the host network — so every adb client (the
+host `adb`, the mantis container, and `quest_pub` via `ppadb`) talks to one server on
+`127.0.0.1:5037`.
+
+Why a container:
+- **Pinned adb binary** — it runs the `platform-tools` adb from a read-only bind (`/pt`), so the version never drifts.
+- **USB without host udev fuss** — `--privileged --device=/dev/bus/usb` hands it the headset directly.
+- **Auth persists** — `~/.android` is bind-mounted, so you approve "Allow USB debugging" on the headset once.
+- **One shared server** — `--net=host` means the daemon on `127.0.0.1:5037` serves the host and every container, avoiding "adb server version mismatch" churn when several clients each start their own.
+
+Create it once (the image is the teleop image, tagged with your username):
+
+```bash
+docker run -d --name adb-server \
+  --privileged --net=host \
+  --device=/dev/bus/usb \
+  -v ~/platform-tools:/pt:ro \
+  -v ~/.android:/root/.android \
+  --entrypoint /pt/adb \
+  prl_ros2:$(id -un) \
+  nodaemon server
+```
+
+Daily use:
+
+```bash
+docker start adb-server           # if it is not already up
+adb kill-server                   # kill any host-local server so clients use the container's
+adb devices                       # the headset should read 'device'
+adb shell am broadcast -a com.oculus.vrpowermanager.prox_close   # keep it awake while off your head
+```
+
+If tracking degrades mid-session, `adb reboot` the headset (see
+[Health check & diagnostics](#health-check--diagnostics)). `unauthorized` in `adb devices`
+means re-accept the prompt inside the headset; `no permissions` is the one udev rule that
+needs root (see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 
 ### What `setup_workstation.sh` does
 
@@ -289,6 +331,43 @@ signatures — then prints ranked problems and what it ruled out:
 (`start` / `report` / `stop`).
 
 ---
+
+## How it works
+
+Three processes, split across the host and the container.
+
+1. **Controller publisher (`quest_pub.py`, host).** Reads the Quest controller pose over USB
+   — adb talks to the `oculus_reader` APK on the headset, which logs poses that
+   `oculus_reader` parses via `adb logcat` — and republishes it as `/vive/pose` +
+   `/vive/buttons`. In `extrapolate` mode it resamples the raw ~50–70 Hz headset stream to a
+   steady 250 Hz predicted from the last two samples.
+
+2. **Teleop bridge (`teleop_mantis.py`, container).** The core loop:
+   - on *engage*, anchors the controller pose to the arm and maps hand motion → a target
+     end-effector pose (scaled, heading-normalized, one-euro filtered);
+   - solves for joint velocities with **Pink differential IK** under a **collision barrier**
+     (a control-barrier-function QP that makes the arm *dodge* instead of freeze), plus
+     singularity damping, joint-lead clamps, and a not-following watchdog;
+   - re-publishes the IK result through an output **shaper thread at 250 Hz** under
+     velocity/acceleration limits — this is why arm motion stays smooth even when the input
+     stream or the ROS executor hiccups;
+   - drives the WSG50 gripper on its own timer, independent of IK health, via a
+     `GripperCommand` action.
+
+3. **Recorder (`lerobot_recorder.py`, inside the bridge).** MENU starts/stops an episode;
+   each primary-camera frame stores one LeRobot frame (state = measured joints + gripper,
+   action = commanded), pairs the secondary/depth cameras by nearest timestamp, and writes a
+   stock LeRobot v3 dataset. Video encoding is deferred to teleop exit so it never competes
+   with the control loop.
+
+Host ↔ container traffic is ROS 2 DDS forced to **UDP-only** (`fastdds_udp_only.xml`),
+because FastDDS shared memory does not cross the container boundary.
+
+**Two design choices that explain the behaviour you see:** the arm command runs on its own
+250 Hz thread, decoupled from the ROS executor, so camera and recording load never stutter
+the arm — but the gripper and buttons *do* share the executor, which is why they are the
+first thing to feel a degraded input stream. And `extrapolate` mode plus the collision
+barrier are the two levers that keep motion usable when tracking or IK gets hard.
 
 ## Files
 
