@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Publish HTC Vive controller pose/buttons to /vive/* (SteamVR backend).
 set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_SETUP="${ROS_SETUP:-$DIR/../SO-100-HTC-vive-teleop/.pixi/envs/default/setup.bash}"

@@ -1,16 +1,4 @@
-"""Meta Quest 2 controller publisher, the Quest counterpart of vive_pub.py.
-
-Publishes the same contract vive_pub.py does, so the teleop side stays untouched:
-    <pose topic>    Float64MultiArray[12] = px py pz + row-major rotation matrix
-    <buttons topic> Float64MultiArray[6]  = trigger_analog, pad, menu, trigger_click,
-                                            home, axis_lock
-Field 6 is a Quest extension; a missing field 6 reads as "never pressed".
-
-Two backends (QUEST_BACKEND): `openvr` (default) takes both controllers from
-SteamVR while ALVR streams over Wi-Fi, `adb` reads poses from the oculus_reader
-APK over the USB cable without SteamVR. Every setting below is env-overridable;
-run with --scan to see what the controller actually reports.
-"""
+"""Meta Quest 2 controller publisher, the Quest counterpart of vive_pub.py."""
 
 import itertools
 import os
@@ -136,12 +124,7 @@ _UNIVERSES = {"raw": "TrackingUniverseRawAndUncalibrated",
 
 
 class OpenVRBackend(object):
-    """Quest 2 through ALVR's SteamVR driver, the same API vive_pub.py uses.
-
-    The controller is picked by hand ROLE (a Quest always reports two), and poses are
-    taken in the STANDING universe, which room setup gravity-aligns; QUEST_UNIVERSE=raw
-    overrides that.
-    """
+    """Quest 2 through ALVR's SteamVR driver, the same API vive_pub.py uses."""
 
     name = "openvr"
 
@@ -296,13 +279,7 @@ _ADB_KEYS = {
 
 
 class AdbBackend(object):
-    """Quest 2 over adb via the oculus_reader APK: no SteamVR, no video stream.
-
-    QUEST_ADB_MODE=native (default) publishes one message per headset sample (~72 Hz)
-    and ignores POSE_PREDICTION. `extrapolate` resamples to 250 Hz off a two-point
-    velocity, which turns every velocity change into a jump the teleop's glitch gate
-    throws away — measured, not theoretical.
-    """
+    """Quest 2 over adb via the oculus_reader APK: no SteamVR, no video stream."""
 
     name = "adb"
 

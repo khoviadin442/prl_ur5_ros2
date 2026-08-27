@@ -44,6 +44,11 @@ ik:
   collision_barrier: true     # gap >= floor as a hard QP inequality: the arm dodges instead of freezing
   d_min: 0.015                # m, minimum link-pair gap
   d_min_table: 0.025          # m, higher floor against the table (real fingers reach lower than the meshes)
+  # Fingertips only: they are what must reach a flat object. The metal gripper
+  # body and the connector boxes keep d_min_table - at a strong tilt THEY are
+  # the lowest geometry. Rollback: delete this key (default = d_min_table).
+  d_min_table_grip: 0.012
+  grip_table_keywords: [finger]
   d_min_self: 0.006           # m, floor for arm self pairs (hull gaps are much tighter than the real ones)
   d_influence: 0.04           # deprecated, no longer read
   barrier_gain: 20.0          # CBF approach rate; keep barrier_gain * (1/rate) <= ~0.2
@@ -122,6 +127,8 @@ teleop:
   home_vel: 0.3               # rad/s of the fastest joint (others scale to arrive together)
   home_check_step_deg: 2.0    # deg, sampling step of the path pre-check
   home_debounce: 0.5          # s between HOME presses
+  menu_debounce: 0.5          # s between MENU presses; a double-tap otherwise starts an
+                              # episode and stops it again before min_frames is reached
   home_done_tol: 0.05         # rad, measured-vs-home that counts as arrived
   home_settle_grace: 3.0      # s to wait for the measured settle after the command arrives
   # Degraded-tracking hold: when the glitch gate rejects this often, the stream has
@@ -166,6 +173,10 @@ teleop:
   shake_split_hz: 3.0         # Hz boundary between the slow (felt) and the fast (buzz) band
   shake_max_hz: 25.0          # Hz ceiling of the fast band
   debug_period: 0.5           # s between console pose dumps (0 = off)
+  # Warn in the log when the /vive/pose rate drops below this in a 10 s window. Healthy Quest
+  # is ~70 Hz; a sustained ~50 Hz means the headset lost 6-DOF controller tracking (out of
+  # camera view / warm after hours) -> choppy motion + laggy gripper. Reboot the headset. 0 = off.
+  pose_hz_warn: 65.0
   # Output shaping: a thread republishes the IK result at out_rate under velocity
   # and acceleration limits. out_accel is the smoothness knob AND part of the
   # max_joint_lead budget, so the speeds and the accel are only ever changed as a set.
@@ -194,7 +205,10 @@ gripper:
 # primary camera stores one frame together with the state/action at that instant.
 record:
   enabled: true
-  repo_id: mantis/teleop      # LeRobot repo id, also the folder layout under root
+  # HF account the dataset is pushed under. push_to_hub has no repo_id argument - it uploads
+  # to `<hf_namespace>/<RECORD_NAME>` - so this must be the account running the push.
+  hf_namespace: khoviadin
+  repo_id: mantis/teleop      # used only when RECORD_NAME is unset
   root: lerobot_data          # dataset dir, relative to this config
   task: "Teleoperated manipulation on the mantis left arm"
   fps: 15                     # MUST equal the camera stream rate
@@ -204,14 +218,34 @@ record:
   cameras:
     left: /camera/echo_camera/color/image_raw
     right: /camera/foxtrot_camera/color/image_raw
+  # Optional 16UC1 depth, keyed by the colour camera it belongs to; each entry adds
+  # observation.images.<name>_depth as a (H, W, 1) uint16 map in MILLIMETRES. The driver runs
+  # with depth_registration: true, so it is already pixel-aligned to that camera's colour
+  # frame. Stored as PNG, not video - 8-bit AV1 cannot carry 16 bits. Comment out to drop
+  # depth; every listed stream must match the primary's trigger or the frame is skipped.
+  depth_cameras:
+    left: /camera/echo_camera/depth/image_raw
+    right: /camera/foxtrot_camera/depth/image_raw
+  # true  = 12-bit HEVC video (lossless codec over a log-quantised 0.01-10 m range; measured
+  #         ~1 mm error at 0.7-2.5 m, and far smaller on disk). Needs lerobot >= 0.6 to READ.
+  # false = lossless 16-bit PNG in millimetres. Bigger, but any lerobot can read it - use this
+  #         if the training side is on an older version.
+  depth_as_video: true    # native lerobot >= 0.6 format; the READING side must also be >= 0.6
   primary_cam: left           # must be the femto-mega hardware-sync primary
+  # Seconds a secondary image may differ from the primary's stamp. Default 0.75/fps = 50 ms.
+  # Depth lags colour by a measured ~24 ms (p95 31), so the old 33 ms dropped ~16% of frames.
+  pair_tol_s: 0.050
   home_on_stop: true          # record the return-to-home ramp as the episode's tail
   min_frames: 15              # shorter episodes are discarded on stop
   image_writer_threads: 8     # lerobot async image writer threads in total
   vcodec: libsvtav1           # episode video codec
   debug_keep_frames: false    # keep episode frames as PNGs under <root>/frames_debug/ to check camera sync
   streaming_encoding: false   # encode during the episode; off, svt-av1 competes with the IK tick
-  batch_encoding_size: 999    # >1 defers video encoding to teleop exit (999 = never mid-session)
+  # >1 defers ALL video encoding to teleop exit: no pause between episodes during a session.
+  # lerobot's own batch flush is bypassed at shutdown (it is broken in 0.6.1, see
+  # lerobot_recorder.shutdown) and the recorder encodes from the on-disk files instead.
+  # 999 = never encode mid-session.
+  batch_encoding_size: 999
 
 topics:
   arm_cmd: /forward_position_controller/commands

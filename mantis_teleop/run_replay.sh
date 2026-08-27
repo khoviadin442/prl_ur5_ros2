@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Replay a recorded LeRobot episode on the Mantis via lerobot-replay.
 set -eo pipefail
 EP="${1:?usage: run_replay.sh <episode index> [task name] [extra args]}"
 shift || true

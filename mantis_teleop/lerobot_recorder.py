@@ -1,16 +1,8 @@
-"""LeRobot episode recorder for the mantis teleop (config section `record:`).
-
-MENU starts an episode, the next press stops it. Every color image from the primary
-camera adds one frame: observation.state = measured arm joints + gripper width,
-action = the commanded ones, observation.images.<cam> = the images. The dataset fps
-is therefore the camera fps and record.fps must match the camera stream.
-
-Everything on disk is written by lerobot's own LeRobotDataset API, so the result is
-a stock LeRobot v3 dataset that lerobot-train and lerobot-replay consume directly.
-The lerobot import and save_episode run off the ROS executor thread.
-"""
+"""LeRobot episode recorder for the mantis teleop (config section `record:`)."""
+import collections
 import os
 import re
+import queue
 import threading
 import time
 from pathlib import Path
@@ -35,35 +27,49 @@ class EpisodeRecorder:
         name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.environ.get("RECORD_NAME", "").strip())
         self.task = os.environ.get("RECORD_TASK", "").strip() \
             or str(cfg.get("task", "mantis teleop"))
-        self.repo_id = ("mantis/" + name) if name else str(cfg.get("repo_id", "mantis/teleop"))
+        ns = str(cfg.get("hf_namespace", "mantis")).strip().strip("/")
+        self.repo_id = f"{ns}/{name}" if name else str(cfg.get("repo_id", f"{ns}/teleop"))
         self.root = Path(T._cfg_path(str(cfg.get("root", "lerobot_data"))))
         if name:
             self.root = self.root / name
         self.min_frames = int(cfg.get("min_frames", 5))
         self.writer_threads = int(cfg.get("image_writer_threads", 4))
         self.vcodec = str(cfg.get("vcodec", "libsvtav1"))
+        self.depth_as_video = bool(cfg.get("depth_as_video", True))
         self.streaming = bool(cfg.get("streaming_encoding", False))
         self.batch = max(1, int(cfg.get("batch_encoding_size", 1)))
         self.debug_frames = bool(cfg.get("debug_keep_frames", False))
         cams = dict(cfg.get("cameras") or {"echo": "/camera/echo_camera/color/image_raw"})
-        self.cam_keys = sorted(cams)
-        self.primary = str(cfg.get("primary_cam") or self.cam_keys[0])
-        if self.primary not in cams:
+        self.color_keys = sorted(cams)
+        depth_cams = dict(cfg.get("depth_cameras") or {})
+        unknown = set(depth_cams) - set(cams)
+        if unknown:
+            raise ValueError(f"record.depth_cameras has {sorted(unknown)}, not in record.cameras")
+        self.depth_of = {f"{k}_depth": t for k, t in sorted(depth_cams.items())}
+        cams = {**cams, **self.depth_of}
+        self.cam_keys = self.color_keys + sorted(self.depth_of)
+        self.primary = str(cfg.get("primary_cam") or self.color_keys[0])
+        if self.primary not in self.color_keys:
             raise ValueError(f"record.primary_cam {self.primary!r} not in record.cameras")
-        self.pair_tol_s = 0.5 / max(self.fps, 1)
+        self.pair_tol_s = float(cfg.get("pair_tol_s", 0.75 / max(self.fps, 1)))
         self._pending = None
         self._dropped = 0
         self._skew_ms = {k: [] for k in self.cam_keys if k != self.primary}
+        self._skew_signed = {}
 
         self.recording = False
         self.episode_index = None
         self._frames = 0
         self._saving = False
         self._save_thread = None
+        self._save_q = queue.Queue()
+        self._next_ep_idx = None
         self._dataset = None
         self._lr = None
         self._lr_err = None
         self._img_msg = {}
+        self._img_hist = {}
+        self._skew_est = {}
         self._skip_warn_t = 0.0
 
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -77,15 +83,44 @@ class EpisodeRecorder:
         self.log.info(f"recorder: dataset {self.repo_id} at {self.root}, "
                       f"cams {cams} @ {self.fps} fps (lerobot loading in the background)")
 
+    def _rgb_encoder(self):
+        """Colour encoder carrying record.vcodec; depth gets DepthEncoderConfig's own defaults."""
+        return self._lr["RGBEncoderConfig"](vcodec=self.vcodec)
+
+    def _patch_depth_image_writer(self):
+        """Teach lerobot 0.4.4's image writer to save a 16-bit depth PNG."""
+        from lerobot.datasets import image_writer as iw
+        import PIL.Image
+
+        if getattr(iw, "_mantis_depth_patch", False):
+            return
+        original = iw.image_array_to_pil_image
+
+        def with_depth(image_array, range_check: bool = True):
+            a = np.asarray(image_array)
+            if a.ndim == 3 and a.shape[-1] == 1:
+                a = a[:, :, 0]
+            if a.ndim == 2 and a.dtype == np.uint16:
+                return PIL.Image.fromarray(a, mode="I;16")
+            return original(image_array, range_check)
+
+        iw.image_array_to_pil_image = with_depth
+        iw._mantis_depth_patch = True
+        self.log.info("recorder: image writer patched for 16-bit depth PNGs")
+
     def _preload(self):
-        """Import lerobot off the executor: torch alone takes seconds and the
-        Bridge must reach 'Teleop ready' without paying for it."""
+        """Import lerobot off the executor: torch alone takes seconds and the Bridge must reach 'Teleop ready' without paying for it."""
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
-            from lerobot.datasets.utils import hw_to_dataset_features, build_dataset_frame
+            from lerobot.utils.feature_utils import hw_to_dataset_features, build_dataset_frame
+            from lerobot.configs.video import DepthEncoderConfig, RGBEncoderConfig
             self._lr = {"LeRobotDataset": LeRobotDataset,
                         "hw_to_dataset_features": hw_to_dataset_features,
-                        "build_dataset_frame": build_dataset_frame}
+                        "build_dataset_frame": build_dataset_frame,
+                        "RGBEncoderConfig": RGBEncoderConfig,
+                        "DepthEncoderConfig": DepthEncoderConfig}
+            if self.depth_of and not self.depth_as_video:
+                self._patch_depth_image_writer()
             self.log.info("recorder: lerobot loaded")
         except Exception as exc:
             self._lr_err = exc
@@ -99,9 +134,14 @@ class EpisodeRecorder:
         return dict(joints), {**joints, **img_shapes}
 
     def _features(self, img_shapes):
+        """Build the LeRobot feature dict for the action and observation (incl. depth) streams."""
         h2d = self._lr["hw_to_dataset_features"]
         act, obs = self._hw_features(img_shapes)
-        return {**h2d(act, "action", True), **h2d(obs, "observation", True)}
+        features = {**h2d(act, "action", True), **h2d(obs, "observation", True)}
+        if not self.depth_as_video:
+            for key in self.depth_of:
+                features[f"observation.images.{key}"]["dtype"] = "image"
+        return features
 
     def _open_dataset(self, img_shapes):
         LRD = self._lr["LeRobotDataset"]
@@ -113,9 +153,11 @@ class EpisodeRecorder:
                           f"moved to {bad} -> creating a fresh one")
         if (self.root / "meta").is_dir():
             try:
-                ds = LRD(self.repo_id, root=self.root, vcodec=self.vcodec,
-                         streaming_encoding=self.streaming,
-                         batch_encoding_size=self.batch)
+                ds = LRD.resume(self.repo_id, root=self.root, rgb_encoder=self._rgb_encoder(),
+                                depth_encoder=self._lr["DepthEncoderConfig"](),
+                                streaming_encoding=self.streaming,
+                                batch_encoding_size=self.batch,
+                                image_writer_threads=self.writer_threads)
             except Exception as exc:
                 raise RuntimeError(
                     f"existing dataset at {self.root} would not load "
@@ -131,48 +173,62 @@ class EpisodeRecorder:
                         f"-> refusing to mix; move the old dataset away")
             if int(ds.fps) != self.fps:
                 raise RuntimeError(f"existing dataset fps {ds.fps} != record.fps {self.fps}")
-            ds.start_image_writer(0, self.writer_threads)
             self.log.info(f"recorder: resuming dataset ({ds.meta.total_episodes} episodes so far)")
         else:
             ds = LRD.create(self.repo_id, self.fps, features, root=self.root,
                             robot_type="mantis_follower", use_videos=True,
                             image_writer_threads=self.writer_threads,
-                            vcodec=self.vcodec, streaming_encoding=self.streaming,
+                            rgb_encoder=self._rgb_encoder(),
+                            depth_encoder=self._lr["DepthEncoderConfig"](),
+                            streaming_encoding=self.streaming,
                             batch_encoding_size=self.batch)
             self.log.info(f"recorder: created new dataset at {self.root}")
         return ds
 
     def _on_image(self, key, msg):
         self._img_msg[key] = (time.monotonic(), msg)
+        if key != self.primary:
+            h = self._img_hist.setdefault(key, collections.deque(maxlen=4))
+            h.append((self._stamp_s(msg), msg))
         if not self.recording:
             return
         if key == self.primary:
-            if self._pending is not None:
+            if self._pending is not None and not self._commit_pending():
                 self._dropped += 1
                 now = time.monotonic()
                 if now - self._skip_warn_t > 2.0:
                     self._skip_warn_t = now
-                    self.log.warn("recorder: frame dropped — secondaries never matched "
-                                  "the primary's trigger (camera down or NOT hw-synced?)")
+                    self.log.warn("recorder: frame dropped — no secondary image within "
+                                  "pair_tol_s of the primary's trigger (camera down, or "
+                                  "the streams are not hw-synced?)")
             self._pending = msg
-        self._try_pair()
 
-    def _try_pair(self):
-        """Write the frame once every camera has the pending trigger's image."""
+    def _commit_pending(self):
+        """Pair the pending primary with the nearest-in-time image of every secondary."""
         p = self._pending
         if p is None:
-            return
+            return False
         ps = self._stamp_s(p)
-        secs = {}
+        secs, offsets = {}, {}
         for key in self.cam_keys:
             if key == self.primary:
                 continue
-            _, m = self._img_msg.get(key, (0.0, None))
-            if m is None or abs(self._stamp_s(m) - ps) > self.pair_tol_s:
-                return
-            secs[key] = m
+            hist = self._img_hist.get(key)
+            if not hist:
+                return False
+            est = self._skew_est.get(key)
+            bias = float(np.median(est)) if est is not None and len(est) >= 5 else 0.0
+            target = ps + bias
+            best = min(hist, key=lambda c: abs(c[0] - target))
+            if abs(best[0] - target) > self.pair_tol_s:
+                return False
+            secs[key], offsets[key] = best[1], best[0] - ps
         self._pending = None
+        for key, off in offsets.items():
+            self._skew_signed.setdefault(key, []).append(1000.0 * off)
+            self._skew_est.setdefault(key, collections.deque(maxlen=60)).append(off)
         self._add_frame(p, secs)
+        return True
 
     @staticmethod
     def _to_rgb(msg):
@@ -192,9 +248,19 @@ class EpisodeRecorder:
             img = img[:, :, :3]
         return np.ascontiguousarray(img)
 
+    @staticmethod
+    def _to_depth(msg):
+        """sensor_msgs/Image 16UC1 -> (H, W, 1) uint16 millimetres, honoring the row stride."""
+        enc = msg.encoding.lower()
+        if enc not in ("16uc1", "mono16"):
+            raise ValueError(f"depth topic encoding {msg.encoding!r} is not 16UC1/mono16")
+        h, w, step = msg.height, msg.width, msg.step
+        buf = np.frombuffer(bytes(msg.data), "<u2" if not msg.is_bigendian else ">u2")
+        img = buf.reshape(h, step // 2)[:, :w]
+        return np.ascontiguousarray(img.astype(np.uint16)[:, :, None])
+
     def _robot_values(self):
-        """Flat lerobot-convention value dicts (action, observation) sampled NOW,
-        or None while the robot state is incomplete."""
+        """Flat lerobot-convention value dicts (action, observation) sampled NOW, or None while the robot state is incomplete."""
         T, n = self.T, self.node
         if not isinstance(n.pos, dict) or not all(j in n.pos for j in T.ARM):
             return None, None
@@ -217,7 +283,7 @@ class EpisodeRecorder:
         try:
             imgs = {self.primary: self._to_rgb(p_msg)}
             for key, msg in sec_msgs.items():
-                imgs[key] = self._to_rgb(msg)
+                imgs[key] = self._to_depth(msg) if key in self.depth_of else self._to_rgb(msg)
                 self._skew_ms[key].append(
                     1000.0 * abs(self._stamp_s(msg) - self._stamp_s(p_msg)))
             act, obs = self._robot_values()
@@ -249,9 +315,6 @@ class EpisodeRecorder:
                           if self._lr_err is None else
                           f"EPISODE unavailable: lerobot import failed ({self._lr_err})")
             return False
-        if self._saving:
-            self.log.warn("EPISODE not started: previous episode still encoding")
-            return False
         act, _ = self._robot_values()
         if act is None:
             self.log.warn("EPISODE not started: joint states incomplete")
@@ -264,7 +327,7 @@ class EpisodeRecorder:
                 self.log.warn(f"EPISODE not started: camera '{key}' has no fresh image "
                               f"(is the camera stack up?)")
                 return False
-            shapes[key] = self._to_rgb(msg).shape
+            shapes[key] = (self._to_depth(msg) if key in self.depth_of else self._to_rgb(msg)).shape
         if self._dataset is None:
             try:
                 self._dataset = self._open_dataset(shapes)
@@ -273,10 +336,13 @@ class EpisodeRecorder:
                 return False
         self._frames = 0
         self._skew_ms = {k: [] for k in self.cam_keys if k != self.primary}
+        self._skew_signed = {}
         self._pending = None
         self._dropped = 0
         self._t_first = self._t_last = 0.0
-        self.episode_index = self._dataset.meta.total_episodes
+        if self._next_ep_idx is None:
+            self._next_ep_idx = self._dataset.meta.total_episodes
+        self.episode_index = self._next_ep_idx
         self.recording = True
         self.log.info(f"EPISODE {self.episode_index} RECORDING "
                       f"(task: {self.task!r}; MENU again to stop)")
@@ -286,6 +352,9 @@ class EpisodeRecorder:
         """End the episode; the save (video encode) runs on a worker thread."""
         if not self.recording:
             return False
+        if self._pending is not None:
+            self._commit_pending()
+            self._pending = None
         self.recording = False
         n, idx = self._frames, self.episode_index
         if self._dropped:
@@ -304,25 +373,46 @@ class EpisodeRecorder:
         for key, sk in self._skew_ms.items():
             if sk:
                 a = np.asarray(sk)
+                sg = np.asarray(self._skew_signed.get(key) or [0.0])
+                med = float(np.median(sg))
                 self.log.info(
                     f"cam sync {key}-{self.primary}: p50={np.percentile(a, 50):.1f}ms "
-                    f"p95={np.percentile(a, 95):.1f}ms max={a.max():.1f}ms over {len(a)} frames"
+                    f"p95={np.percentile(a, 95):.1f}ms max={a.max():.1f}ms over {len(a)} frames "
+                    f"| signed median {med:+.1f}ms ({'lags' if med > 0 else 'leads'} the primary)"
                     + ("" if np.percentile(a, 95) < 1000.0 / self.fps * 0.5 else
                        " — POOR SYNC, check the femto-mega trigger cable"))
         if n < self.min_frames:
             self.log.warn(f"EPISODE {idx} DISCARDED ({n} frames < min_frames {self.min_frames})")
-            self._dataset.clear_episode_buffer()
+            w = self._dataset.writer
+            w.episode_buffer = w._create_episode_buffer(episode_index=self._next_ep_idx)
             return True
         self._saving = True
         defer = self.batch > 1 and not self.streaming
         self.log.info(f"EPISODE {idx} STOPPED ({n} frames, {n / self.fps:.1f}s) -> "
-                      + ("saving (video encode deferred to teleop exit)..." if defer
-                         else "encoding..."))
-        self._save_thread = threading.Thread(target=self._save_worker, args=(idx, n), daemon=True)
-        self._save_thread.start()
+                      + ("queued (saved and encoded at teleop exit)" if defer
+                         else "queued for saving"))
+        w = self._dataset.writer
+        buf = w.episode_buffer
+        self._next_ep_idx += 1
+        w.episode_buffer = w._create_episode_buffer(episode_index=self._next_ep_idx)
+        if self._save_thread is None or not self._save_thread.is_alive():
+            self._save_thread = threading.Thread(target=self._save_loop, daemon=True)
+            self._save_thread.start()
+        self._save_q.put((idx, n, buf))
         return True
 
-    def _save_worker(self, idx, n):
+    def _save_loop(self):
+        """Drain queued episodes one at a time; recording keeps running alongside."""
+        while True:
+            item = self._save_q.get()
+            try:
+                if item is None:
+                    return
+                self._save_worker(*item)
+            finally:
+                self._save_q.task_done()
+
+    def _save_worker(self, idx, n, buf):
         try:
             os.setpriority(os.PRIO_PROCESS, 0, 19)
         except OSError:
@@ -331,8 +421,9 @@ class EpisodeRecorder:
         try:
             if self.debug_frames:
                 self._keep_frames(idx)
-            self._dataset.save_episode()
-            pending = int(getattr(self._dataset, "episodes_since_last_encoding", 0))
+            self._dataset.save_episode(episode_data=buf, parallel_encoding=False)
+            pending = int(getattr(getattr(self._dataset, "writer", None),
+                                  "_episodes_since_last_encoding", 0))
             if pending > 0:
                 self.log.info(f"EPISODE {idx} SAVED ({n} frames, "
                               f"total {self._dataset.meta.total_episodes} episodes; "
@@ -341,8 +432,8 @@ class EpisodeRecorder:
                 self.log.info(f"EPISODE {idx} SAVED ({n} frames, encode {time.monotonic() - t0:.1f}s, "
                               f"total {self._dataset.meta.total_episodes} episodes)")
         except KeyboardInterrupt:
-            print(f"recorder: EPISODE {idx} LOST — Ctrl-C killed the video encoder "
-                  f"mid-episode (wait for 'SAVED' before exiting to keep it)", flush=True)
+            print(f"recorder: EPISODE {idx} LOST — the encode was interrupted "
+                  f"(second Ctrl-C, or the process group was killed)", flush=True)
             try:
                 self._dataset.clear_episode_buffer()
             except (Exception, KeyboardInterrupt):
@@ -357,11 +448,10 @@ class EpisodeRecorder:
             self._saving = False
 
     def _keep_frames(self, idx):
-        """debug_keep_frames: hardlink the episode's PNGs aside BEFORE
-        save_episode encodes and deletes them (see the flag's comment)."""
+        """debug_keep_frames: hardlink the episode's PNGs aside BEFORE save_episode encodes and deletes them (see the flag's comment)."""
         import shutil
         try:
-            self._dataset._wait_image_writer()
+            self._dataset.writer._wait_image_writer()
             dbg = self.root / "frames_debug" / f"episode-{idx:06d}"
             kept = 0
             for key in self.cam_keys:
@@ -379,9 +469,9 @@ class EpisodeRecorder:
         import glob
         import shutil
         import pandas as pd
-        from lerobot.datasets.lerobot_dataset import _encode_video_worker
-        from lerobot.datasets.utils import (DEFAULT_VIDEO_PATH, get_file_size_in_mb,
-                                            update_chunk_file_indices)
+        from lerobot.datasets.dataset_writer import _encode_video_worker
+        from lerobot.datasets.io_utils import get_file_size_in_mb
+        from lerobot.datasets.utils import DEFAULT_VIDEO_PATH, update_chunk_file_indices
         from lerobot.datasets.video_utils import (concatenate_video_files,
                                                   get_video_duration_in_s)
         ds = self._dataset
@@ -404,7 +494,9 @@ class EpisodeRecorder:
                     file_idx = int(last[f"videos/{key}/file_index"])
                     break
             for ep_idx in range(total - pending, total):
-                tmp = _encode_video_worker(key, ep_idx, root, self.fps, self.vcodec)
+                enc = (self._lr["DepthEncoderConfig"]() if key.endswith("_depth")
+                       else self._rgb_encoder())
+                tmp = _encode_video_worker(key, ep_idx, root, self.fps, enc)
                 dur = get_video_duration_in_s(tmp)
                 if chunk_idx is None:
                     chunk_idx, file_idx = 0, 0
@@ -443,18 +535,23 @@ class EpisodeRecorder:
             self.stop()
         t = self._save_thread
         if t is not None and t.is_alive():
-            print("recorder: closing (the episode that was still ENCODING at Ctrl-C "
-                  "is lost — the signal kills the encoder processes too; the dataset "
-                  "itself closes cleanly)...", flush=True)
+            left = self._save_q.qsize()
+            print(f"recorder: writing {left or 1} queued episode(s) to disk before exit "
+                  f"(a few seconds each). Press Ctrl-C again to abandon them.", flush=True)
             try:
-                t.join(timeout=120.0)
+                self._save_q.put(None)
+                t.join(timeout=600.0)
             except KeyboardInterrupt:
-                print("recorder: encoder wait interrupted -> that episode is dropped",
+                print("recorder: save wait interrupted -> the episodes still queued are dropped",
                       flush=True)
         if self._dataset is not None:
             try:
-                self._dataset.stop_image_writer()
-                pending = int(getattr(self._dataset, "episodes_since_last_encoding", 0))
+                w = getattr(self._dataset, "writer", None)
+                if w is not None:
+                    w.stop_image_writer()
+                pending = int(getattr(w, "_episodes_since_last_encoding", 0))
+                if w is not None and pending:
+                    w._episodes_since_last_encoding = 0
                 self._dataset.finalize()
                 if pending > 0:
                     print(f"recorder: encoding {pending} deferred episode video(s) at "

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Host launcher: start the Vive publisher and the Mantis teleop bridge together.
 set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_SETUP="${ROS_SETUP:-$DIR/../SO-100-HTC-vive-teleop/.pixi/envs/default/setup.bash}"

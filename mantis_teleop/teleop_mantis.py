@@ -1,13 +1,10 @@
-"""Mantis (dual UR5) VR teleop bridge: VR controller pose -> Pink diff-IK -> left arm.
-
-Config is config_teleop_mantis.yaml next to this file, or $teleop_config.
-Pose and buttons arrive on the /vive topics from quest_pub.py or vive_pub.py.
-"""
+"""Mantis (dual UR5) VR teleop bridge: VR controller pose -> Pink diff-IK -> left arm."""
 
 import os
 import yaml
 import time
 import threading
+import warnings
 import numpy as np
 import pinocchio as pin
 import qpsolvers
@@ -69,6 +66,8 @@ QP_DAMPING = 1e-12
 COLLISION_BARRIER = bool(CFG["ik"].get("collision_barrier", True))
 D_MIN = float(CFG["ik"].get("d_min", 0.015))
 D_MIN_TABLE = float(CFG["ik"].get("d_min_table", CFG["ik"].get("d_min", 0.015)))
+D_MIN_TABLE_GRIP = float(CFG["ik"].get("d_min_table_grip", D_MIN_TABLE))
+GRIP_TABLE_KEYWORDS = tuple(CFG["ik"].get("grip_table_keywords", ["finger"]))
 D_MIN_SELF = float(CFG["ik"].get("d_min_self", 0.006))
 BARRIER_GAIN = float(CFG["ik"].get("barrier_gain", 15.0))
 BARRIER_SAFE_GAIN = float(CFG["ik"].get("barrier_safe_gain", 0.0))
@@ -116,6 +115,7 @@ FILTER_MIN_CUTOFF = float(CFG["teleop"].get("filter_min_cutoff", 1.5))
 FILTER_BETA = float(CFG["teleop"].get("filter_beta", 15.0))
 MEDIAN_N = int(CFG["teleop"].get("pose_median", 5))
 POSE_TIMEOUT = float(CFG["teleop"].get("pose_timeout", 0.2))
+POSE_HZ_WARN = float(CFG["teleop"].get("pose_hz_warn", 65.0))
 PIVOT_MIN_ROT = float(CFG["teleop"].get("pivot_min_rot", 0.05))
 POSE_JUMP_LIN = float(CFG["teleop"].get("pose_jump_lin", 0.0))
 POSE_JUMP_ANG = float(CFG["teleop"].get("pose_jump_ang", 0.0))
@@ -128,6 +128,7 @@ HOME_Q = np.radians(np.asarray(CFG["teleop"].get(
 HOME_VEL = float(CFG["teleop"].get("home_vel", 0.3))
 HOME_CHECK_STEP = np.radians(float(CFG["teleop"].get("home_check_step_deg", 2.0)))
 HOME_DEBOUNCE = float(CFG["teleop"].get("home_debounce", 0.5))
+MENU_DEBOUNCE = float(CFG["teleop"].get("menu_debounce", 0.5))
 HOME_DONE_TOL = float(CFG["teleop"].get("home_done_tol", 0.05))
 HOME_SETTLE_GRACE = float(CFG["teleop"].get("home_settle_grace", 3.0))
 BLEND_TICKS = int(CFG["teleop"].get("disengage_blend_ticks", 5))
@@ -379,21 +380,7 @@ except Exception:
 
 if _SCBarrier is not None:
     class MarginSelfCollisionBarrier(_SCBarrier):
-        """SelfCollisionBarrier with a per-pair floor: h_i = d_i - d_min_i
-        (self pairs get D_MIN_SELF, everything else D_MIN). Rows of h and J are
-        both selected by MARGIN — the parent selects J rows by raw distance,
-        which would mismatch h rows under per-pair floors.
-
-        PERFORMANCE (2026-07-31). The jacobian used to be 1.6 ms of a 2.3 ms
-        ik.step: not the pinocchio calls (64 getJointJacobian = 0.02 ms) but
-        ~250 numpy calls on 3- and 6-vectors, which are pure per-call overhead.
-        It is now assembled with one gather + two einsums (0.40 ms, verified
-        bit-identical to 1e-15 over 300 random configurations), and _margins /
-        the row selection / the jacobian are memoised on the identity of
-        configuration.q — pink asks for the jacobian and the barrier back to
-        back on the same configuration, and Bridge.tick asks a third time to
-        find the ACTIVE rows. q is a fresh read-only array on every
-        Configuration.update, so identity is an exact cache key."""
+        """SelfCollisionBarrier with a per-pair floor: h_i = d_i - d_min_i (self pairs get D_MIN_SELF, everything else D_MIN)."""
         def __init__(self, n, gain, safe_displacement_gain, d_min_vec, pair_joints):
             d_min_vec = np.asarray(d_min_vec, float)
             super().__init__(n, gain=gain, safe_displacement_gain=safe_displacement_gain, d_min=float(d_min_vec.min()))
@@ -468,11 +455,7 @@ if _SCBarrier is not None:
             return J
 
         def active_rows(self, configuration, v, tol=1e-4):
-            """Indices (into collisionPairs) of the barrier rows whose inequality
-            J v >= -gain*h is tight for the solved velocity v — i.e. the pairs the
-            barrier is ACTUALLY holding back this tick. `blocked` used to be
-            "some margin is small", which on this robot is true in every pose
-            (structural pairs ride their floors), so it never carried information."""
+            """Indices (into collisionPairs) of the barrier rows whose inequality J v >= -gain*h is tight for the solved velocity v — i.e."""
             if float(np.max(np.abs(v))) < 1e-3:
                 return []
             m = self._margins(configuration)
@@ -502,10 +485,7 @@ class PinkIK:
     """Pinocchio model + Pink diff-IK for the mantis left arm, with self- and environment-collision avoidance."""
 
     def __init__(self, urdf_path, ee_frame, arm_joints, position_cost=POSITION_COST, orientation_cost=ORIENTATION_COST, lm_damping=LM_DAMPING, gain=TASK_GAIN, posture_cost=POSTURE_COST, vel_scale=VEL_SCALE, solver=None, srdf_path=None, package_dirs=None, collision_margin=COLLISION_MARGIN, locked_q=None, logger=None):
-        """Build the reduced model, collision geometry, tasks, joint limits, collision barrier and QP solver.
-
-        locked_q: parked pose of the non-teleoperated joints (defaults to config LOCKED_Q).
-        """
+        """Build the reduced model, collision geometry, tasks, joint limits, collision barrier and QP solver."""
         self.log = logger
         full = pin.buildModelFromUrdf(urdf_path)
         keep = set(arm_joints)
@@ -577,6 +557,7 @@ class PinkIK:
                         raise ImportError("pink.barriers not importable")
                     arm_jids = {self.model.getJointId(j) for j in self.arm_joints if self.model.existJointName(j)}
                     on_arm = lambda gi: self.geom.geometryObjects[gi].parentJoint in arm_jids
+                    grip_table_names, plain_table_names = [], []
                     def _floor(cp):
                         both = on_arm(cp.first) and on_arm(cp.second)
                         if both and (self._is_wire_box(cp.first) or self._is_wire_box(cp.second)):
@@ -586,6 +567,11 @@ class PinkIK:
                         na = self.geom.geometryObjects[cp.first].name.lower()
                         nb = self.geom.geometryObjects[cp.second].name.lower()
                         if "table" in na or "table" in nb:
+                            other = nb if "table" in na else na
+                            if any(k in other for k in GRIP_TABLE_KEYWORDS):
+                                grip_table_names.append(other)
+                                return D_MIN_TABLE_GRIP
+                            plain_table_names.append(other)
                             return D_MIN_TABLE
                         return D_MIN
                     self.pair_dmin = np.array([_floor(cp) for cp in self.geom.collisionPairs])
@@ -596,6 +582,8 @@ class PinkIK:
                     self.barrier = MarginSelfCollisionBarrier(n_bar, gain=BARRIER_GAIN, safe_displacement_gain=BARRIER_SAFE_GAIN, d_min_vec=self.pair_dmin, pair_joints=pair_joints)
                     n_self = int(np.sum(self.pair_dmin == D_MIN_SELF))
                     self._info(f"MarginSelfCollisionBarrier dim={n_bar} of {n_avail} pairs (d_min={D_MIN}, d_min_self={D_MIN_SELF} on {n_self} self pairs, gain={BARRIER_GAIN})")
+                    self._info(f"  table floors: d_min_table_grip={D_MIN_TABLE_GRIP} on {len(grip_table_names)} pairs {sorted(grip_table_names)}; "
+                               f"d_min_table={D_MIN_TABLE} on {len(plain_table_names)} pairs {sorted(plain_table_names)}")
                 except Exception as exc:
                     self._warn(f"pink.barriers unavailable ({exc}) -> falling back to collision reject")
             else:
@@ -1369,6 +1357,7 @@ class Bridge(Node):
         self._pad_now = False
         self._menu_was = False
         self._menu_now = False
+        self._menu_t = 0.0
         self._trig_now = 0.0
         self._home_now = False
         self._home_was = False
@@ -2006,7 +1995,8 @@ class Bridge(Node):
                         f"PAD ignored: ready={self.shared['ready']} fresh={fresh} "
                         f"pose_age={now - self._pose_t:.2f}s | {why}")
         self._pad_was = pad
-        if menu and not self._menu_was:
+        if menu and not self._menu_was and (now - self._menu_t) > MENU_DEBOUNCE:
+            self._menu_t = now
             if self.recorder is not None:
                 if self.recorder.recording:
                     homed = False
@@ -2398,17 +2388,8 @@ class Bridge(Node):
         if DEBUG_PERIOD > 0.0 and (now_tick - self._debug_t) >= DEBUG_PERIOD:
             self._debug_t = now_tick
             gap_d, gap_m, gap_pair = self.ik.min_gap()
-            lines = ["blocked=%s min-gap=%+.4f margin=%+.4f sigma=%.4f %s"
-                     % (self.ik.blocked, gap_d, gap_m, self.ik.sigma_min, gap_pair)]
-            for i, j in enumerate(ARM):
-                cmd = float(q_arm[i])
-                meas = self.pos.get(j) if isinstance(self.pos, dict) else None
-                eff = self.eff.get(j) if isinstance(self.eff, dict) else None
-                ms = "n/a" if meas is None else "%+.4f" % meas
-                gs = "n/a" if meas is None else "%+.4f" % (cmd - meas)
-                es = "n/a" if eff is None else "%+.3f" % eff
-                lines.append("%-26s cmd=%+.4f meas=%s gap=%s eff=%s" % (j, cmd, ms, gs, es))
-            print("\n".join(lines), flush=True)
+            print("blocked=%s min-gap=%+.4f margin=%+.4f sigma=%.4f %s"
+                  % (self.ik.blocked, gap_d, gap_m, self.ik.sigma_min, gap_pair), flush=True)
         now_m = time.monotonic()
         if self._steptimes and now_m - self._steptime_last >= 10.0:
             a = np.array(self._steptimes)
@@ -2440,6 +2421,13 @@ class Bridge(Node):
                     f"{np.percentile(oa,95):.1f} rad/s max {ol.max():.2f}/{oa.max():.1f} "
                     f"| glitches +{self._pose_glitches} "
                     f"(worst {self._pose_glitch_worst:.1f}x gate) | holds +{self._degrade_holds}")
+                hz = len(pd) / 10.0
+                if 0.0 < POSE_HZ_WARN and hz < POSE_HZ_WARN:
+                    self.get_logger().warn(
+                        f"QUEST POSE RATE LOW: {hz:.0f} Hz (< {POSE_HZ_WARN:.0f} Hz) -> the headset "
+                        f"lost solid 6-DOF tracking of the controller (out of camera view or warm "
+                        f"after long use). Motion turns choppy and the gripper lags; reboot the "
+                        f"headset ('adb reboot') to restore ~70 Hz.")
             if self._piv_n >= 20:
                 try:
                     r = np.linalg.solve(self._piv_M + 1e-9 * np.eye(3), self._piv_b)
@@ -2506,6 +2494,11 @@ def snapshot_parked_pose(timeout=PARKED_SNAPSHOT_TIMEOUT):
 
 def main():
     """Init rclpy, spin the Bridge node, shut down ROS cleanly."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"coroutine 'Executor\._make_handler\.<locals>\.handler' was never awaited",
+        category=RuntimeWarning,
+    )
     rclpy.init()
     node = None
     try:

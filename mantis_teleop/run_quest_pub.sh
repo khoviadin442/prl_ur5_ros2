@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
+# Publish Quest controller pose/buttons to /vive/*; env defaults below are overridable.
 set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_SETUP="${ROS_SETUP:-$DIR/../SO-100-HTC-vive-teleop/.pixi/envs/default/setup.bash}"
 QUEST_DEPS="${QUEST_DEPS:-$DIR/../quest_deps}"
 OCULUS_READER="${OCULUS_READER:-$DIR/../oculus_reader}"
+export QUEST_BACKEND="${QUEST_BACKEND:-adb}"
+export QUEST_ADB_MODE="${QUEST_ADB_MODE:-extrapolate}"
+export QUEST_ROT_OFFSET="${QUEST_ROT_OFFSET:--90,0,0}"
 source "$ROS_SETUP" 2>/dev/null
 
 case "${QUEST_BACKEND:-openvr}" in
